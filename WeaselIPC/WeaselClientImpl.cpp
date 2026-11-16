@@ -191,19 +191,31 @@ bool ClientImpl::_WriteClientInfo() {
 }
 
 namespace {
-// Focus / notification commands:
-// a miss self-heals on the next event, so cap them tightly to keep window
-// switching imperceptible. Compose / keystroke commands need a reliable answer,
-// so keep the larger cap.
+// Timeout classes, in increasing order of "a miss is expensive":
+//  - focus / notification: a miss self-heals on the next event, so cap small to
+//    keep window switching imperceptible;
+//  - keystroke: needs a reliable answer, keep the compose-path cap;
+//  - session: a miss is NOT harmless, see below;
+//  - maintenance: the deployer is not a UI thread, waiting is correct.
 DWORD _TimeoutForCommand(WEASEL_IPC_COMMAND msg, DWORD wParam) {
   switch (msg) {
+    case WEASEL_IPC_START_SESSION:
+    case WEASEL_IPC_END_SESSION:
+      // These map to rime create_session()/destroy_session(). Right after a
+      // deployment every host reconnects at once, so each call has to load
+      // dictionaries and open userdbs under contention. Timing out here drops
+      // the pipe, the server discards the session it just built, and the host
+      // immediately reconnects and asks for another one -- a rebuild loop that
+      // leaves userdb handles open.
+      return PipeChannelBase::kClientSessionTimeoutMs;
+    case WEASEL_IPC_START_MAINTENANCE:
+    case WEASEL_IPC_END_MAINTENANCE:
+      // Must wait until the server has torn down its sessions and released the
+      // userdb files, otherwise the deployer opens a db that is still held.
+      return PipeChannelBase::kClientMaintenanceTimeoutMs;
     case WEASEL_IPC_ECHO:
     case WEASEL_IPC_FOCUS_IN:
     case WEASEL_IPC_FOCUS_OUT:
-    case WEASEL_IPC_START_SESSION:
-    case WEASEL_IPC_END_SESSION:
-    case WEASEL_IPC_START_MAINTENANCE:
-    case WEASEL_IPC_END_MAINTENANCE:
     case WEASEL_IPC_UPDATE_INPUT_POS:
     case WEASEL_IPC_TRAY_COMMAND:
       return PipeChannelBase::kClientFocusTimeoutMs;

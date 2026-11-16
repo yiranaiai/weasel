@@ -26,11 +26,23 @@ class PipeChannelBase {
 
   /* Caps for pipe I/O issued from client (host app) threads.
      compose/keystroke path keeps a larger cap so a busy server never causes a
-     key to be dropped; focus/notification path uses a tiny cap so window
+     key to be dropped; focus/notification path uses a small cap so window
      switching stays imperceptible (a missed notification self-heals on the next
-     event). */
+     event); session/maintenance control messages get generous caps because a
+     timeout there is not harmless: it drops the pipe, so the server throws away
+     the session it was building and the host reconnects and asks again. */
   static const DWORD kClientIoTimeoutMs = 500;
-  static const DWORD kClientFocusTimeoutMs = 25;
+  static const DWORD kClientFocusTimeoutMs = 100;
+  /* START/END_SESSION make the server call rime
+     create_session()/destroy_session; right after a deployment or a maintenance
+     cycle that costs hundreds of ms per host, so a tight cap here makes hosts
+     drop and rebuild sessions in a loop. This only has to cover "the server is
+     actually working on it". */
+  static const DWORD kClientSessionTimeoutMs = 2000;
+  /* START/END_MAINTENANCE wait for the server to tear down every session and
+     release userdb handles before the deployer touches them. The deployer is
+     not a UI thread, so waiting is the correct behaviour here. */
+  static const DWORD kClientMaintenanceTimeoutMs = 15000;
 
  protected:
   /* To ensure connection before operation */
