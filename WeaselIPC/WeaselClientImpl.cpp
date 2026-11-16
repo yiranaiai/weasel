@@ -190,12 +190,52 @@ bool ClientImpl::_WriteClientInfo() {
   return true;
 }
 
+namespace {
+// Timeout classes, in increasing order of "a miss is expensive":
+//  - focus / notification: a miss self-heals on the next event, so cap small to
+//    keep window switching imperceptible;
+//  - keystroke: needs a reliable answer, keep the compose-path cap;
+//  - session: a miss is NOT harmless, see below;
+//  - maintenance: the deployer is not a UI thread, waiting is correct.
+DWORD _TimeoutForCommand(WEASEL_IPC_COMMAND msg, DWORD wParam) {
+  switch (msg) {
+    case WEASEL_IPC_START_SESSION:
+    case WEASEL_IPC_END_SESSION:
+      // These map to rime create_session()/destroy_session(). Right after a
+      // deployment every host reconnects at once, so each call has to load
+      // dictionaries and open userdbs under contention. Timing out here drops
+      // the pipe, the server discards the session it just built, and the host
+      // immediately reconnects and asks for another one -- a rebuild loop that
+      // leaves userdb handles open.
+      return PipeChannelBase::kClientSessionTimeoutMs;
+    case WEASEL_IPC_START_MAINTENANCE:
+    case WEASEL_IPC_END_MAINTENANCE:
+      // Must wait until the server has torn down its sessions and released the
+      // userdb files, otherwise the deployer opens a db that is still held.
+      return PipeChannelBase::kClientMaintenanceTimeoutMs;
+    case WEASEL_IPC_ECHO:
+    case WEASEL_IPC_FOCUS_IN:
+    case WEASEL_IPC_FOCUS_OUT:
+    case WEASEL_IPC_UPDATE_INPUT_POS:
+    case WEASEL_IPC_TRAY_COMMAND:
+      return PipeChannelBase::kClientFocusTimeoutMs;
+    case WEASEL_IPC_PROCESS_KEY_EVENT:
+      // keycode 0 is the focus-refresh probe from OnSetThreadFocus, not a real
+      // keystroke; keep real keys on the reliable compose-path cap
+      return wParam == 0 ? PipeChannelBase::kClientFocusTimeoutMs
+                         : PipeChannelBase::kClientIoTimeoutMs;
+    default:
+      return PipeChannelBase::kClientIoTimeoutMs;
+  }
+}
+}  // namespace
+
 LRESULT ClientImpl::_SendMessage(WEASEL_IPC_COMMAND Msg,
                                  DWORD wParam,
                                  DWORD lParam) {
   try {
     PipeMessage req{Msg, wParam, lParam};
-    return channel.Transact(req);
+    return channel.Transact(req, _TimeoutForCommand(Msg, wParam));
   } catch (DWORD /* ex */) {
     return 0;
   }

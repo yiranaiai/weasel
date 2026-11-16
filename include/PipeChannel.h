@@ -24,20 +24,51 @@ class PipeChannelBase {
   PipeChannelBase(std::wstring&& pn_cmd, size_t bs, SECURITY_ATTRIBUTES* s);
   ~PipeChannelBase();
 
+  /* Caps for pipe I/O issued from client (host app) threads.
+     compose/keystroke path keeps a larger cap so a busy server never causes a
+     key to be dropped; focus/notification path uses a small cap so window
+     switching stays imperceptible (a missed notification self-heals on the next
+     event); session/maintenance control messages get generous caps because a
+     timeout there is not harmless: it drops the pipe, so the server throws away
+     the session it was building and the host reconnects and asks again. */
+  static const DWORD kClientIoTimeoutMs = 500;
+  static const DWORD kClientFocusTimeoutMs = 100;
+  /* START/END_SESSION make the server call rime
+     create_session()/destroy_session; right after a deployment or a maintenance
+     cycle that costs hundreds of ms per host, so a tight cap here makes hosts
+     drop and rebuild sessions in a loop. This only has to cover "the server is
+     actually working on it". */
+  static const DWORD kClientSessionTimeoutMs = 2000;
+  /* START/END_MAINTENANCE wait for the server to tear down every session and
+     release userdb handles before the deployer touches them. The deployer is
+     not a UI thread, so waiting is the correct behaviour here. */
+  static const DWORD kClientMaintenanceTimeoutMs = 15000;
+
  protected:
   /* To ensure connection before operation */
   bool _Ensure();
-  /* Connect pipe as client */
-  HANDLE _Connect(const wchar_t* name);
+  /* Connect pipe as client, failing fast when the server is busy */
+  HANDLE _Connect();
   /* To reconnect message pipe */
   void _Reconnect();
   /* Try to connect for one time */
   HANDLE _TryConnect();
-  size_t _WritePipe(HANDLE p, size_t s, char* b);
+  size_t _WritePipe(HANDLE p, size_t s, char* b, DWORD timeout_ms = INFINITE);
   void _FinalizePipe(HANDLE& p);
-  void _Receive(HANDLE pipe, LPVOID msg, size_t rec_len);
+  void _Receive(HANDLE pipe,
+                LPVOID msg,
+                size_t rec_len,
+                DWORD timeout_ms = INFINITE);
   /* Try to get a connection from client */
   HANDLE _ConnectServerPipe(std::wstring& pn);
+  /* Wait for an overlapped I/O with timeout;
+     returns ERROR_SUCCESS or ERROR_MORE_DATA, throws DWORD on failure or
+     timeout */
+  DWORD _WaitIo(HANDLE pipe,
+                OVERLAPPED& ov,
+                BOOL op_result,
+                DWORD timeout_ms,
+                DWORD* transferred = nullptr);
   inline bool _Invalid(HANDLE p) const { return p == INVALID_HANDLE_VALUE; }
 
   HANDLE* _GetPipeHandle() const {
@@ -117,11 +148,11 @@ class PipeChannel : public PipeChannelBase {
     return *this;
   }
 
-  _TyRes Transact(Msg& msg) {
+  _TyRes Transact(Msg& msg, DWORD timeout_ms = kClientIoTimeoutMs) {
     _Ensure();
     HANDLE* phandle = _GetPipeHandle();
-    _Send(*phandle, msg);
-    return _ReceiveResponse();
+    _Send(*phandle, msg, timeout_ms);
+    return _ReceiveResponse(timeout_ms);
   }
 
   void ClearBufferStream() {
@@ -148,7 +179,7 @@ class PipeChannel : public PipeChannelBase {
   }
 
  protected:
-  void _Send(HANDLE pipe, Msg& msg) {
+  void _Send(HANDLE pipe, Msg& msg, DWORD timeout_ms = INFINITE) {
     auto ctx = _GetContext();
     char* pbuff = ctx->buffer.get();
     DWORD lwritten = 0;
@@ -166,18 +197,19 @@ class PipeChannel : public PipeChannelBase {
       data_sz = buff_size;
 
     try {
-      _WritePipe(pipe, data_sz, pbuff);
+      _WritePipe(pipe, data_sz, pbuff, timeout_ms);
     } catch (...) {
       _Reconnect();
-      _WritePipe(_GetPipeHandle(), data_sz, pbuff);
+      // Resolve keeper: 取重連後的新句柄(補上 c9938e7 缺的取值) + 帶超時(#1914)
+      _WritePipe(*_GetPipeHandle(), data_sz, pbuff, timeout_ms);
     }
     ClearBufferStream();
   }
 
-  _TyRes _ReceiveResponse() {
+  _TyRes _ReceiveResponse(DWORD timeout_ms = kClientIoTimeoutMs) {
     HANDLE* phandle = _GetPipeHandle();
     _TyRes result;
-    _Receive(*phandle, &result, sizeof(result));
+    _Receive(*phandle, &result, sizeof(result), timeout_ms);
     return result;
   }
 
