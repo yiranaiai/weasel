@@ -4,6 +4,8 @@
 #include "ResponseParser.h"
 #include "CandidateList.h"
 
+#include <imm.h>
+
 /* Start Composition */
 class CStartCompositionEditSession : public CEditSession {
  public:
@@ -133,6 +135,234 @@ void WeaselTSF::_EndComposition(com_ptr<ITfContext> pContext,
   }
 }
 
+/* Composition anchor helpers.
+ *
+ * TSF hosts are expected to report the caret rectangle through
+ * ITfContextView::GetTextExt. WPS Writer/Presentation draw their own caret and
+ * never answer that query, so the candidate window used to keep whatever
+ * default position the UI had, which lands in the bottom-right corner. The
+ * helpers below build a fallback chain so a usable screen-space anchor is
+ * nearly always available:
+ *
+ *   1. GetTextExt (normal path)
+ *   2. GUITHREADINFO::rcCaret of the host UI thread
+ *   3. the IMM32 composition window position
+ *   4. the last anchor that was actually reported
+ *
+ * All rects are screen coordinates in physical pixels: Weasel is per-monitor
+ * DPI aware and every API used here already reports physical pixels, so no
+ * manual scaling is applied.
+ */
+namespace {
+
+RECT _VirtualScreenRect() {
+  RECT rc;
+  rc.left = ::GetSystemMetrics(SM_XVIRTUALSCREEN);
+  rc.top = ::GetSystemMetrics(SM_YVIRTUALSCREEN);
+  rc.right = rc.left + ::GetSystemMetrics(SM_CXVIRTUALSCREEN);
+  rc.bottom = rc.top + ::GetSystemMetrics(SM_CYVIRTUALSCREEN);
+  return rc;
+}
+
+bool _IsOnVirtualScreen(const RECT& rc) {
+  const RECT screen = _VirtualScreenRect();
+  if (screen.right <= screen.left || screen.bottom <= screen.top)
+    return true;  // metrics unavailable, do not second-guess the host
+  RECT overlap;
+  return ::IntersectRect(&overlap, &rc, &screen) != FALSE;
+}
+
+/* A host that cannot answer GetTextExt tends to return a degenerate point or
+ * coordinates glued to the virtual screen corner. Reject those, and reject
+ * anything that does not overlap the host window: a caret is always drawn
+ * somewhere inside the window it belongs to. */
+bool _IsAnchorUsable(const RECT& rc, HWND hwnd_host) {
+  if (rc.right < rc.left || rc.bottom < rc.top)
+    return false;
+  if (rc.left == rc.right && rc.top == rc.bottom)
+    return false;
+  if (!_IsOnVirtualScreen(rc))
+    return false;
+  if (hwnd_host != nullptr) {
+    RECT window;
+    if (::GetWindowRect(hwnd_host, &window) && window.right > window.left &&
+        window.bottom > window.top) {
+      // A clipped caret may sit a few pixels outside the client area.
+      ::InflateRect(&window, 16, 16);
+      RECT overlap;
+      if (::IntersectRect(&overlap, &rc, &window) == FALSE)
+        return false;
+    }
+  }
+  return true;
+}
+
+/* imm32.lib is not linked into WeaselTSF (see WeaselTSF.vcxproj and
+ * WeaselTSF/xmake.lua), so the entry points below are resolved at run time
+ * instead of adding a new link dependency. */
+using PfnImmGetContext = HIMC(WINAPI*)(HWND);
+using PfnImmReleaseContext = BOOL(WINAPI*)(HWND, HIMC);
+using PfnImmGetCompositionWindow = BOOL(WINAPI*)(HIMC, LPCOMPOSITIONFORM);
+
+struct Imm32Api {
+  PfnImmGetContext get_context = nullptr;
+  PfnImmReleaseContext release_context = nullptr;
+  PfnImmGetCompositionWindow get_composition_window = nullptr;
+
+  bool usable() const {
+    return get_context != nullptr && release_context != nullptr &&
+           get_composition_window != nullptr;
+  }
+};
+
+const Imm32Api& _Imm32() {
+  static const Imm32Api api = []() {
+    Imm32Api loaded;
+    HMODULE module = ::LoadLibraryW(L"imm32.dll");
+    if (module != nullptr) {
+      loaded.get_context = reinterpret_cast<PfnImmGetContext>(
+          ::GetProcAddress(module, "ImmGetContext"));
+      loaded.release_context = reinterpret_cast<PfnImmReleaseContext>(
+          ::GetProcAddress(module, "ImmReleaseContext"));
+      loaded.get_composition_window =
+          reinterpret_cast<PfnImmGetCompositionWindow>(
+              ::GetProcAddress(module, "ImmGetCompositionWindow"));
+    }
+    return loaded;
+  }();
+  return api;
+}
+
+/* Window that owns the caret. The context view window is authoritative; the
+ * focused window and the foreground window are fallbacks for hosts that do not
+ * hand one out. */
+HWND _CaretHostWindow(HWND hwnd_host) {
+  if (hwnd_host != nullptr)
+    return hwnd_host;
+  HWND hwnd = ::GetFocus();
+  if (hwnd != nullptr)
+    return hwnd;
+  return ::GetForegroundWindow();
+}
+
+bool _AnchorFromCaret(HWND hwnd_host, RECT* anchor) {
+  HWND hwnd = _CaretHostWindow(hwnd_host);
+  if (hwnd == nullptr)
+    return false;
+  const DWORD thread_id = ::GetWindowThreadProcessId(hwnd, nullptr);
+  if (thread_id == 0)
+    return false;
+
+  GUITHREADINFO info = {};
+  info.cbSize = sizeof(info);
+  if (!::GetGUIThreadInfo(thread_id, &info) || info.hwndCaret == nullptr)
+    return false;
+
+  POINT top_left = {info.rcCaret.left, info.rcCaret.top};
+  POINT bottom_right = {info.rcCaret.right, info.rcCaret.bottom};
+  if (!::ClientToScreen(info.hwndCaret, &top_left) ||
+      !::ClientToScreen(info.hwndCaret, &bottom_right))
+    return false;
+
+  const RECT rc = {top_left.x, top_left.y, bottom_right.x, bottom_right.y};
+  if (rc.bottom <= rc.top)
+    return false;
+  if (!_IsAnchorUsable(rc, hwnd_host))
+    return false;
+  *anchor = rc;
+  return true;
+}
+
+bool _AnchorFromImm32(HWND hwnd_host, RECT* anchor) {
+  const Imm32Api& api = _Imm32();
+  if (!api.usable())
+    return false;
+  HWND hwnd = _CaretHostWindow(hwnd_host);
+  if (hwnd == nullptr)
+    return false;
+
+  HIMC himc = api.get_context(hwnd);
+  if (himc == nullptr)
+    return false;
+
+  bool found = false;
+  COMPOSITIONFORM form = {};
+  // Only CFS_POINT and CFS_FORCE_POSITION put a caret position in
+  // ptCurrentPos (client coordinates); CFS_RECT only fills rcArea.
+  if (api.get_composition_window(himc, &form) &&
+      (form.dwStyle & (CFS_POINT | CFS_FORCE_POSITION))) {
+    POINT pt = form.ptCurrentPos;
+    if (::ClientToScreen(hwnd, &pt)) {
+      const RECT rc = {pt.x, pt.y, pt.x, pt.y + 1};
+      if (_IsAnchorUsable(rc, hwnd_host)) {
+        *anchor = rc;
+        found = true;
+      }
+    }
+  }
+  api.release_context(hwnd, himc);
+  return found;
+}
+
+/* Last anchor that was reported to the UI. Deliberately per process: a stale
+ * caret position is still a better guess than the bottom-right default. */
+struct AnchorStore {
+  CRITICAL_SECTION lock;
+  bool has_anchor = false;
+  RECT anchor = {};
+
+  AnchorStore() { ::InitializeCriticalSection(&lock); }
+};
+
+AnchorStore& _AnchorState() {
+  static AnchorStore store;
+  return store;
+}
+
+void _RememberAnchor(const RECT& rc) {
+  AnchorStore& store = _AnchorState();
+  ::EnterCriticalSection(&store.lock);
+  store.anchor = rc;
+  store.has_anchor = true;
+  ::LeaveCriticalSection(&store.lock);
+}
+
+bool _LastAnchor(RECT* anchor) {
+  AnchorStore& store = _AnchorState();
+  bool found = false;
+  ::EnterCriticalSection(&store.lock);
+  if (store.has_anchor) {
+    *anchor = store.anchor;
+    found = true;
+  }
+  ::LeaveCriticalSection(&store.lock);
+  return found;
+}
+
+/* Keep the anchor inside the virtual desktop so a host that reports a caret on
+ * a detached monitor cannot push the candidate window off screen. */
+void _ClampAnchor(RECT& rc) {
+  const RECT screen = _VirtualScreenRect();
+  if (screen.right <= screen.left || screen.bottom <= screen.top)
+    return;
+  const int max_x = screen.right - 1;
+  const int max_y = screen.bottom - 1;
+  int dx = 0;
+  int dy = 0;
+  if (rc.left < screen.left)
+    dx = screen.left - rc.left;
+  else if (rc.left > max_x)
+    dx = max_x - rc.left;
+  if (rc.top < screen.top)
+    dy = screen.top - rc.top;
+  else if (rc.top > max_y)
+    dy = max_y - rc.top;
+  if (dx != 0 || dy != 0)
+    ::OffsetRect(&rc, dx, dy);
+}
+
+}  // namespace
+
 /* Get Text Extent */
 class CGetTextExtentEditSession : public CEditSession {
  public:
@@ -180,30 +410,51 @@ STDMETHODIMP CGetTextExtentEditSession::DoEditSession(TfEditCookie ec) {
     pRange = selection.range;
   }
 
+  HWND hwnd_host = nullptr;
+  if (_pContextView != nullptr)
+    _pContextView->GetWnd(&hwnd_host);
+
+  bool anchored = false;
   if ((_pContextView->GetTextExt(ec, pRange, &rc, &fClipped)) == S_OK &&
       (rc.left != 0 || rc.top != 0)) {
     // get the foreground window pos and check if rc from GetTextExt is out of
     // window
     if (_enhancedPosition) {
-      HWND hwnd;
+      HWND hwnd = hwnd_host != nullptr ? hwnd_host : ::GetForegroundWindow();
       RECT rcForegroundWindow;
-      hwnd = GetForegroundWindow();
-      ::GetWindowRect(hwnd, &rcForegroundWindow);
-
-      if (rc.left < rcForegroundWindow.left ||
-          rc.left > rcForegroundWindow.right ||
-          rc.top < rcForegroundWindow.top ||
-          rc.top > rcForegroundWindow.bottom) {
-        POINT pt;
-        bool hasCaret = ::GetCaretPos(&pt);
-        int offsetx = rcForegroundWindow.left - rc.left + (hasCaret ? pt.x : 0);
-        int offsety = rcForegroundWindow.top - rc.top + (hasCaret ? pt.y : 0);
-        rc.left += offsetx;
-        rc.right += offsetx;
-        rc.top += offsety;
-        rc.bottom += offsety;
+      if (hwnd != nullptr && ::GetWindowRect(hwnd, &rcForegroundWindow)) {
+        if (rc.left < rcForegroundWindow.left ||
+            rc.left > rcForegroundWindow.right ||
+            rc.top < rcForegroundWindow.top ||
+            rc.top > rcForegroundWindow.bottom) {
+          POINT pt;
+          bool hasCaret = ::GetCaretPos(&pt);
+          int offsetx =
+              rcForegroundWindow.left - rc.left + (hasCaret ? pt.x : 0);
+          int offsety = rcForegroundWindow.top - rc.top + (hasCaret ? pt.y : 0);
+          rc.left += offsetx;
+          rc.right += offsetx;
+          rc.top += offsety;
+          rc.bottom += offsety;
+        }
       }
     }
+    anchored = _IsAnchorUsable(rc, hwnd_host);
+  }
+
+  /* WPS Writer/Presentation never answer GetTextExt, and some hosts return a
+   * degenerate rect. Fall back to the caret exposed by the host UI thread,
+   * then to the IMM32 composition window, then to the previous anchor. */
+  if (!anchored)
+    anchored = _AnchorFromCaret(hwnd_host, &rc);
+  if (!anchored)
+    anchored = _AnchorFromImm32(hwnd_host, &rc);
+  if (!anchored)
+    anchored = _LastAnchor(&rc);
+
+  if (anchored) {
+    _ClampAnchor(rc);
+    _RememberAnchor(rc);
     _pTextService->_SetCompositionPosition(rc);
   }
   return S_OK;
