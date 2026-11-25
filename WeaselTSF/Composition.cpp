@@ -7,6 +7,11 @@
 #include <imm.h>
 #include <stdio.h>
 
+/* Deferred probe state, shared by the composition helpers and the edit sessions
+ * below. See _ArmProbeWrite for what the two flags mean. */
+static std::atomic<bool> g_probe_armed{false};
+static std::atomic<bool> g_probe_disabled{false};
+
 /* Start Composition */
 class CStartCompositionEditSession : public CEditSession {
  public:
@@ -104,8 +109,13 @@ STDMETHODIMP CEndCompositionEditSession::DoEditSession(TfEditCookie ec) {
 
   _pTextService->_ClearCompositionDisplayAttributes(ec, _pContext);
 
+  /* Clear the dummy text we set before, if any. A probe filler goes even on a
+   * commit, where the caller asked not to clear: the filler is ours, and
+   * leaving it would put an invisible character into the document. */
+  const bool probe_pending = g_probe_armed.exchange(false);
   com_ptr<ITfRange> pCompositionRange;
-  if (_clear && _pComposition->GetRange(&pCompositionRange) == S_OK)
+  if ((_clear || probe_pending) &&
+      _pComposition->GetRange(&pCompositionRange) == S_OK)
     pCompositionRange->SetText(ec, 0, L"", 0);
 
   // Drop ownership before EndComposition(). Some applications notify
@@ -583,121 +593,51 @@ int _CompositionEmpty(TfEditCookie ec, ITfComposition* composition) {
   return cmp == 0 ? 1 : 0;
 }
 
-bool _AnchorFromProbeWrite(TfEditCookie ec,
-                           ITfContextView* view,
-                           ITfComposition* composition,
-                           HWND hwnd_host,
-                           RECT* anchor) {
-  static std::atomic<bool> disabled{false};
+/* Probe, phase one: put an invisible filler into the composition and leave it
+ * there.
+ *
+ * Some hosts answer GetTextExt only for text they have already laid out, and
+ * the layout pass runs after this edit session returns: a filler read back
+ * inside the same session always comes back as the corner sentinel, which is
+ * exactly what WPS Writer and Presentation do. So arm the probe here and let
+ * the next update read the extent in its own session (see
+ * CProbeMeasureEditSession). A zero width space is invisible, so the extra
+ * character cannot be seen while it waits.
+ *
+ * A composition that holds text is never overwritten: under
+ * preedit_type = inline that text is the preedit of this very service. A
+ * composition that holds text here is either our own stale filler from an
+ * update that never measured it - removed - or a preedit, which is left alone.
+ */
+bool _ArmProbeWrite(TfEditCookie ec, ITfComposition* composition) {
+  if (g_probe_disabled.load() || composition == nullptr)
+    return false;
 
-  bool found = false;
-  RECT rc = {};
-  HRESULT hr_set = E_FAIL;
-  HRESULT hr_ext = E_FAIL;
-  HRESULT hr_clear = E_FAIL;
-  int before = -1;
-  int after_set = -1;
-  int after_clear = -1;
-  std::string attempts;
+  const int empty = _CompositionEmpty(ec, composition);
+  if (empty == 0) {
+    com_ptr<ITfRange> stale;
+    if (composition->GetRange(&stale) == S_OK && stale != nullptr)
+      stale->SetText(ec, 0, L"", 0);
+    g_probe_armed.store(false);
+    return false;
+  }
+  if (empty != 1)
+    return false;  // cannot tell, do not write
 
-  /* A zero width filler is invisible, but it may also carry no layout: a host
-   * that only answers for characters it can place has nothing to place. Try a
-   * space and a letter first, then the zero width space. Every filler is
-   * removed again inside this same edit session, so nothing is painted and
-   * nothing survives the session. */
-  static const wchar_t kFillers[] = {L' ', L'a', L'\u200B'};
+  com_ptr<ITfRange> range;
+  if (composition->GetRange(&range) != S_OK || range == nullptr)
+    return false;
+  if (range->SetText(ec, 0, L"\u200B", 1) != S_OK)
+    return false;
 
-  do {
-    if (disabled.load() || view == nullptr || composition == nullptr)
-      break;
-
-    /* Never touch a composition that already holds text: that text is the
-     * preedit of another mode and must not be replaced. A failed length query
-     * (-1) is tolerated because the whole probe only runs where the cheap
-     * extent queries already failed. */
-    before = _CompositionEmpty(ec, composition);
-    if (before == 0)
-      break;
-
-    for (wchar_t filler : kFillers) {
-      hr_set = E_FAIL;
-      hr_ext = E_FAIL;
-      hr_clear = E_FAIL;
-      after_set = -1;
-      after_clear = -1;
-      rc = {};
-
-      com_ptr<ITfRange> comp;
-      if (composition->GetRange(&comp) != S_OK || comp == nullptr)
-        break;
-
-      const wchar_t probe_text[] = {filler, L'\0'};
-      hr_set = comp->SetText(ec, 0, probe_text, 1);
-      if (hr_set != S_OK)
-        break;
-
-      after_set = _CompositionEmpty(ec, composition);
-
-      com_ptr<ITfRange> query;
-      if (composition->GetRange(&query) == S_OK && query != nullptr) {
-        BOOL clipped = FALSE;
-        hr_ext = view->GetTextExt(ec, query, &rc, &clipped);
-      }
-
-      /* Take the filler back out before anything else, on success and on
-       * failure alike, then verify against the composition itself rather than
-       * the range we kept. */
-      com_ptr<ITfRange> clean;
-      if (composition->GetRange(&clean) == S_OK && clean != nullptr)
-        hr_clear = clean->SetText(ec, 0, L"", 0);
-
-      after_clear = _CompositionEmpty(ec, composition);
-      if (after_clear == 0) {
-        // cch = 0 left it behind; exactly one character was inserted.
-        com_ptr<ITfRange> clean2;
-        if (composition->GetRange(&clean2) == S_OK && clean2 != nullptr) {
-          hr_clear = clean2->SetText(ec, 1, L"", 0);
-          after_clear = _CompositionEmpty(ec, composition);
-        }
-      }
-      if (after_clear == 0) {
-        // Filler survived: stop probing in this process for good.
-        disabled.store(true);
-      }
-
-      char line[224];
-      ::sprintf_s(line, sizeof(line),
-                  "| ch=%04x set=0x%lx ext=0x%lx clear=0x%lx empty=%d/%d/%d "
-                  "rc=(%ld,%ld,%ld,%ld) ",
-                  static_cast<unsigned>(filler), (long)hr_set, (long)hr_ext,
-                  (long)hr_clear, before, after_set, after_clear, rc.left,
-                  rc.top, rc.right, rc.bottom);
-      attempts += line;
-
-      if (disabled.load() || after_clear < 0)
-        break;  // could not confirm the filler is gone
-      if (hr_ext != S_OK)
-        continue;
-
-      const int height = rc.bottom > rc.top ? rc.bottom - rc.top : 1;
-      RECT candidate = {rc.left, rc.top, rc.left, rc.top + height};
-      if (_IsAnchorUsable(candidate, hwnd_host)) {
-        *anchor = candidate;
-        found = true;
-        break;
-      }
-    }
-  } while (false);
-
+  g_probe_armed.store(true);
   FILE* fp = _OpenTraceFile();
   if (fp != nullptr) {
     const std::string now = current_time();
-    ::fprintf(fp, "%s probe %s anchored=%d\n", now.c_str(),
-              attempts.empty() ? "skipped" : attempts.c_str(), found ? 1 : 0);
+    ::fprintf(fp, "%s probe armed\n", now.c_str());
     ::fclose(fp);
   }
-
-  return found;
+  return true;
 }
 
 /* Last anchor that was reported to the UI. Deliberately per process: a stale
@@ -759,6 +699,100 @@ void _ClampAnchor(RECT& rc) {
 
 }  // namespace
 
+/* Probe, phase two: read the extent of the filler armed by the previous update,
+ * then take it back out. Runs in its own edit session, i.e. after the host has
+ * laid the filler out - the step WPS refuses to do inside the session that
+ * inserted it. */
+class CProbeMeasureEditSession : public CEditSession {
+ public:
+  CProbeMeasureEditSession(com_ptr<WeaselTSF> pTextService,
+                           com_ptr<ITfContext> pContext,
+                           com_ptr<ITfComposition> pComposition)
+      : CEditSession(pTextService, pContext), _pComposition(pComposition) {}
+
+  /* ITfEditSession */
+  STDMETHODIMP DoEditSession(TfEditCookie ec);
+
+ private:
+  com_ptr<ITfComposition> _pComposition;
+};
+
+STDMETHODIMP CProbeMeasureEditSession::DoEditSession(TfEditCookie ec) {
+  /* The composition may have ended between the two sessions - a commit on the
+   * same key, a focus change - and then there is nothing to measure. */
+  if (!g_probe_armed.load() || _pComposition == nullptr ||
+      _pTextService == nullptr ||
+      !_pTextService->_IsCurrentComposition(_pComposition))
+    return S_OK;
+
+  HWND hwnd_host = nullptr;
+  com_ptr<ITfContextView> view;
+  if (_pContext != nullptr && _pContext->GetActiveView(&view) == S_OK &&
+      view != nullptr)
+    view->GetWnd(&hwnd_host);
+
+  HRESULT hr_ext = E_FAIL;
+  RECT rc = {};
+  if (view != nullptr && _pComposition != nullptr) {
+    com_ptr<ITfRange> range;
+    if (_pComposition->GetRange(&range) == S_OK && range != nullptr) {
+      BOOL clipped = FALSE;
+      hr_ext = view->GetTextExt(ec, range, &rc, &clipped);
+    }
+  }
+
+  /* Take the filler out whatever the extent said, then verify against the
+   * composition itself rather than the range kept above. */
+  int empty_after = -1;
+  if (_pComposition != nullptr) {
+    com_ptr<ITfRange> clean;
+    if (_pComposition->GetRange(&clean) == S_OK && clean != nullptr)
+      clean->SetText(ec, 0, L"", 0);
+    empty_after = _CompositionEmpty(ec, _pComposition);
+    if (empty_after == 0) {
+      // cch = 0 left it behind; exactly one character was inserted.
+      com_ptr<ITfRange> clean2;
+      if (_pComposition->GetRange(&clean2) == S_OK && clean2 != nullptr) {
+        clean2->SetText(ec, 1, L"", 0);
+        empty_after = _CompositionEmpty(ec, _pComposition);
+      }
+    }
+    if (empty_after == 0)
+      g_probe_disabled.store(true);  // never probe this process again
+  }
+  g_probe_armed.store(false);
+
+  bool found = false;
+  if (hr_ext == S_OK) {
+    const int height = rc.bottom > rc.top ? rc.bottom - rc.top : 1;
+    RECT candidate = {rc.left, rc.top, rc.left, rc.top + height};
+    if (_IsAnchorUsable(candidate, hwnd_host)) {
+      rc = candidate;
+      found = true;
+    }
+  }
+  /* The window is only published from a position, so always publish one even
+   * when the measurement failed. */
+  if (!found && !_LastAnchor(&rc))
+    _AnchorFromHostWindow(hwnd_host, &rc);
+  _ClampAnchor(rc);
+  _RememberAnchor(rc);
+
+  FILE* fp = _OpenTraceFile();
+  if (fp != nullptr) {
+    const std::string now = current_time();
+    ::fprintf(fp,
+              "%s probe2 ext=0x%lx empty=%d anchored=%d final=(%ld,%ld,%ld,%ld)"
+              "\n",
+              now.c_str(), (long)hr_ext, empty_after, found ? 1 : 0, rc.left,
+              rc.top, rc.right, rc.bottom);
+    ::fclose(fp);
+  }
+
+  _pTextService->_SetCompositionPosition(rc);
+  return S_OK;
+}
+
 /* Get Text Extent */
 class CGetTextExtentEditSession : public CEditSession {
  public:
@@ -766,11 +800,13 @@ class CGetTextExtentEditSession : public CEditSession {
                             com_ptr<ITfContext> pContext,
                             com_ptr<ITfContextView> pContextView,
                             com_ptr<ITfComposition> pComposition,
-                            bool enhancedPosition)
+                            bool enhancedPosition,
+                            TfClientId client_id)
       : CEditSession(pTextService, pContext) {
     _pContextView = pContextView;
     _pComposition = pComposition;
     _enhancedPosition = enhancedPosition;
+    _client_id = client_id;
   }
 
   /* ITfEditSession */
@@ -780,6 +816,7 @@ class CGetTextExtentEditSession : public CEditSession {
   com_ptr<ITfContextView> _pContextView;
   com_ptr<ITfComposition> _pComposition;
   bool _enhancedPosition;
+  TfClientId _client_id;
 };
 
 STDMETHODIMP CGetTextExtentEditSession::DoEditSession(TfEditCookie ec) {
@@ -880,13 +917,11 @@ STDMETHODIMP CGetTextExtentEditSession::DoEditSession(TfEditCookie ec) {
     anchored = true;
     source = "neighbour_select";
   }
-  /* Hosts that expose no text at all still answer for a range that carries a
-   * character, so borrow our own composition for the query. */
-  if (!anchored && _pComposition != nullptr &&
-      _AnchorFromProbeWrite(ec, _pContextView, _pComposition, hwnd_host, &rc)) {
-    anchored = true;
-    source = "probe_write";
-  }
+  /* Hosts that expose no text at all still answer once their layout has seen a
+   * character, so arm the deferred probe: this session inserts an invisible
+   * filler, the next update measures it. */
+  if (!anchored && _pComposition != nullptr)
+    _ArmProbeWrite(ec, _pComposition);
   if (!anchored && _AnchorFromCaretPos(hwnd_host, &rc)) {
     anchored = true;
     source = "caret_pos";
@@ -912,6 +947,23 @@ STDMETHODIMP CGetTextExtentEditSession::DoEditSession(TfEditCookie ec) {
   _TraceDiag(hr_ext, ext_rc, ext_clipped, hr_sel, sel_rc, _pContextView,
              hwnd_host, source, rc);
   _pTextService->_SetCompositionPosition(rc);
+
+  /* The filler is in place. Ask for the measurement session from inside this
+   * one so the host runs it next, with the layout of the filler already done -
+   * the whole point of splitting the probe. */
+  if (g_probe_armed.load() && _pComposition != nullptr) {
+    com_ptr<CProbeMeasureEditSession> pMeasure;
+    pMeasure.Attach(
+        new CProbeMeasureEditSession(_pTextService, _pContext, _pComposition));
+    HRESULT hr_probe = E_FAIL;
+    if (pMeasure != nullptr) {
+      _pContext->RequestEditSession(_client_id, pMeasure,
+                                    TF_ES_ASYNCDONTCARE | TF_ES_READWRITE,
+                                    &hr_probe);
+    }
+    if (FAILED(hr_probe))
+      g_probe_armed.store(false);  // the filler would never be measured
+  }
   return S_OK;
 }
 
@@ -920,10 +972,11 @@ BOOL WeaselTSF::_UpdateCompositionWindow(com_ptr<ITfContext> pContext) {
   com_ptr<ITfContextView> pContextView;
   if (pContext->GetActiveView(&pContextView) != S_OK)
     return FALSE;
+
   com_ptr<CGetTextExtentEditSession> pEditSession;
-  pEditSession.Attach(
-      new CGetTextExtentEditSession(this, pContext, pContextView, _pComposition,
-                                    _cand->style().enhanced_position));
+  pEditSession.Attach(new CGetTextExtentEditSession(
+      this, pContext, pContextView, _pComposition,
+      _cand->style().enhanced_position, _tfClientId));
   if (pEditSession == NULL) {
     return FALSE;
   }
