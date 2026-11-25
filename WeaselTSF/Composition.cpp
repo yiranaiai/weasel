@@ -598,6 +598,14 @@ bool _AnchorFromProbeWrite(TfEditCookie ec,
   int before = -1;
   int after_set = -1;
   int after_clear = -1;
+  std::string attempts;
+
+  /* A zero width filler is invisible, but it may also carry no layout: a host
+   * that only answers for characters it can place has nothing to place. Try a
+   * space and a letter first, then the zero width space. Every filler is
+   * removed again inside this same edit session, so nothing is painted and
+   * nothing survives the session. */
+  static const wchar_t kFillers[] = {L' ', L'a', L'\u200B'};
 
   do {
     if (disabled.load() || view == nullptr || composition == nullptr)
@@ -611,65 +619,81 @@ bool _AnchorFromProbeWrite(TfEditCookie ec,
     if (before == 0)
       break;
 
-    com_ptr<ITfRange> comp;
-    if (composition->GetRange(&comp) != S_OK || comp == nullptr)
-      break;
+    for (wchar_t filler : kFillers) {
+      hr_set = E_FAIL;
+      hr_ext = E_FAIL;
+      hr_clear = E_FAIL;
+      after_set = -1;
+      after_clear = -1;
+      rc = {};
 
-    hr_set = comp->SetText(ec, 0, L"\u200B", 1);
-    if (hr_set != S_OK)
-      break;
+      com_ptr<ITfRange> comp;
+      if (composition->GetRange(&comp) != S_OK || comp == nullptr)
+        break;
 
-    after_set = _CompositionEmpty(ec, composition);
+      const wchar_t probe_text[] = {filler, L'\0'};
+      hr_set = comp->SetText(ec, 0, probe_text, 1);
+      if (hr_set != S_OK)
+        break;
 
-    com_ptr<ITfRange> query;
-    if (composition->GetRange(&query) == S_OK && query != nullptr) {
-      BOOL clipped = FALSE;
-      hr_ext = view->GetTextExt(ec, query, &rc, &clipped);
-    }
+      after_set = _CompositionEmpty(ec, composition);
 
-    /* Take the filler back out before anything else, on success and on
-     * failure alike, then verify against the composition itself rather than
-     * the range we kept. */
-    com_ptr<ITfRange> clean;
-    if (composition->GetRange(&clean) == S_OK && clean != nullptr)
-      hr_clear = clean->SetText(ec, 0, L"", 0);
-
-    after_clear = _CompositionEmpty(ec, composition);
-    if (after_clear == 0) {
-      // cch = 0 left it behind; exactly one character was inserted.
-      com_ptr<ITfRange> clean2;
-      if (composition->GetRange(&clean2) == S_OK && clean2 != nullptr) {
-        hr_clear = clean2->SetText(ec, 1, L"", 0);
-        after_clear = _CompositionEmpty(ec, composition);
+      com_ptr<ITfRange> query;
+      if (composition->GetRange(&query) == S_OK && query != nullptr) {
+        BOOL clipped = FALSE;
+        hr_ext = view->GetTextExt(ec, query, &rc, &clipped);
       }
-    }
-    if (after_clear == 0) {
-      // Filler survived: stop probing in this process for good.
-      disabled.store(true);
-      break;
-    }
-    if (after_clear < 0 && hr_clear != S_OK)
-      break;  // could not confirm the filler is gone
-    if (hr_ext != S_OK)
-      break;
 
-    const int height = rc.bottom > rc.top ? rc.bottom - rc.top : 1;
-    RECT candidate = {rc.left, rc.top, rc.left, rc.top + height};
-    if (_IsAnchorUsable(candidate, hwnd_host)) {
-      *anchor = candidate;
-      found = true;
+      /* Take the filler back out before anything else, on success and on
+       * failure alike, then verify against the composition itself rather than
+       * the range we kept. */
+      com_ptr<ITfRange> clean;
+      if (composition->GetRange(&clean) == S_OK && clean != nullptr)
+        hr_clear = clean->SetText(ec, 0, L"", 0);
+
+      after_clear = _CompositionEmpty(ec, composition);
+      if (after_clear == 0) {
+        // cch = 0 left it behind; exactly one character was inserted.
+        com_ptr<ITfRange> clean2;
+        if (composition->GetRange(&clean2) == S_OK && clean2 != nullptr) {
+          hr_clear = clean2->SetText(ec, 1, L"", 0);
+          after_clear = _CompositionEmpty(ec, composition);
+        }
+      }
+      if (after_clear == 0) {
+        // Filler survived: stop probing in this process for good.
+        disabled.store(true);
+      }
+
+      char line[224];
+      ::sprintf_s(line, sizeof(line),
+                  "| ch=%04x set=0x%lx ext=0x%lx clear=0x%lx empty=%d/%d/%d "
+                  "rc=(%ld,%ld,%ld,%ld) ",
+                  static_cast<unsigned>(filler), (long)hr_set, (long)hr_ext,
+                  (long)hr_clear, before, after_set, after_clear, rc.left,
+                  rc.top, rc.right, rc.bottom);
+      attempts += line;
+
+      if (disabled.load() || after_clear < 0)
+        break;  // could not confirm the filler is gone
+      if (hr_ext != S_OK)
+        continue;
+
+      const int height = rc.bottom > rc.top ? rc.bottom - rc.top : 1;
+      RECT candidate = {rc.left, rc.top, rc.left, rc.top + height};
+      if (_IsAnchorUsable(candidate, hwnd_host)) {
+        *anchor = candidate;
+        found = true;
+        break;
+      }
     }
   } while (false);
 
   FILE* fp = _OpenTraceFile();
   if (fp != nullptr) {
     const std::string now = current_time();
-    ::fprintf(fp,
-              "%s probe set=0x%lx ext=0x%lx clear=0x%lx empty=%d/%d/%d "
-              "rc=(%ld,%ld,%ld,%ld) anchored=%d\n",
-              now.c_str(), (long)hr_set, (long)hr_ext, (long)hr_clear, before,
-              after_set, after_clear, rc.left, rc.top, rc.right, rc.bottom,
-              found ? 1 : 0);
+    ::fprintf(fp, "%s probe %s anchored=%d\n", now.c_str(),
+              attempts.empty() ? "skipped" : attempts.c_str(), found ? 1 : 0);
     ::fclose(fp);
   }
 
