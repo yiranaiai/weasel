@@ -170,8 +170,8 @@ RECT _VirtualScreenRect() {
   return rc;
 }
 
-/* Caret rects are degenerate by construction: a caret has no width, and a text
- * extent may report no height. IntersectRect() answers FALSE for those, because
+/* Caret rects have no width: a caret is a vertical line, so hosts report
+ * (x, top, x, bottom). IntersectRect() answers FALSE for such a rect because
  * the intersection has no area, so it cannot be used to test containment.
  * Compare edges instead - touching counts as overlapping. */
 bool _RectTouches(const RECT& a, const RECT& b) {
@@ -189,11 +189,16 @@ bool _IsOnVirtualScreen(const RECT& rc) {
 /* A host that cannot answer GetTextExt tends to return a degenerate point or
  * coordinates glued to the virtual screen corner. Reject those, and reject
  * anything that does not overlap the host window: a caret is always drawn
- * somewhere inside the window it belongs to. */
+ * somewhere inside the window it belongs to.
+ *
+ * Zero width must stay acceptable, WPS Writer answers (x, top, x, bottom) for
+ * a real caret. Zero height must not: no caret is a horizontal line, and both
+ * the corner sentinel and the enhanced-position repair below produce exactly
+ * that shape - (0, 150, 1, 150) for a full screen WPS window. */
 bool _IsAnchorUsable(const RECT& rc, HWND hwnd_host) {
   if (rc.right < rc.left || rc.bottom < rc.top)
     return false;
-  if (rc.left == rc.right && rc.top == rc.bottom)
+  if (rc.bottom == rc.top)
     return false;
   if (!_IsOnVirtualScreen(rc))
     return false;
