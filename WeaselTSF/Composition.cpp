@@ -480,48 +480,64 @@ bool _AnchorFromNeighbourRange(TfEditCookie ec,
                                ITfContextView* view,
                                ITfRange* range,
                                HWND hwnd_host,
+                               const char* label,
                                RECT* anchor) {
-  if (view == nullptr || range == nullptr)
-    return false;
-
-  com_ptr<ITfRange> probe;
-  if (range->Clone(&probe) != S_OK || probe == nullptr)
-    return false;
-
-  LONG shifted = 0;
-  bool forward = true;
-  if (probe->ShiftEnd(ec, 1, &shifted, nullptr) != S_OK || shifted <= 0) {
-    forward = false;
-    if (probe->ShiftStart(ec, -1, &shifted, nullptr) != S_OK || shifted == 0)
-      return false;
-  }
-
-  RECT rc = {};
-  BOOL clipped = FALSE;
-  const HRESULT hr = view->GetTextExt(ec, probe, &rc, &clipped);
-
   bool found = false;
-  RECT candidate = {};
-  if (hr == S_OK) {
+  bool forward = true;
+  RECT rc = {};
+  HRESULT hr_clone = E_FAIL;
+  HRESULT hr_fwd = E_FAIL;
+  HRESULT hr_bwd = E_FAIL;
+  HRESULT hr_ext = E_FAIL;
+  LONG cch_fwd = 0;
+  LONG cch_bwd = 0;
+
+  do {
+    if (view == nullptr || range == nullptr)
+      break;
+
+    com_ptr<ITfRange> probe;
+    hr_clone = range->Clone(&probe);
+    if (hr_clone != S_OK || probe == nullptr)
+      break;
+
+    hr_fwd = probe->ShiftEnd(ec, 1, &cch_fwd, nullptr);
+    if (hr_fwd != S_OK || cch_fwd <= 0) {
+      forward = false;
+      hr_bwd = probe->ShiftStart(ec, -1, &cch_bwd, nullptr);
+      if (hr_bwd != S_OK || cch_bwd == 0)
+        break;
+    }
+
+    BOOL clipped = FALSE;
+    hr_ext = view->GetTextExt(ec, probe, &rc, &clipped);
+    if (hr_ext != S_OK)
+      break;
+
     const int height = rc.bottom > rc.top ? rc.bottom - rc.top : 1;
+    RECT candidate = {};
     if (forward)
       candidate = {rc.left, rc.top, rc.left, rc.top + height};
     else
       candidate = {rc.right, rc.top, rc.right, rc.top + height};
-    found = _IsAnchorUsable(candidate, hwnd_host);
-  }
+    if (_IsAnchorUsable(candidate, hwnd_host)) {
+      *anchor = candidate;
+      found = true;
+    }
+  } while (false);
 
   FILE* fp = _OpenTraceFile();
   if (fp != nullptr) {
     const std::string now = current_time();
-    ::fprintf(fp, "%s neigh dir=%s hr=0x%lx rc=(%ld,%ld,%ld,%ld) anchored=%d\n",
-              now.c_str(), forward ? "fwd" : "bwd", (long)hr, rc.left, rc.top,
-              rc.right, rc.bottom, found ? 1 : 0);
+    ::fprintf(fp,
+              "%s neigh %s dir=%s clone=0x%lx fwd=0x%lx/%ld bwd=0x%lx/%ld "
+              "ext=0x%lx rc=(%ld,%ld,%ld,%ld) anchored=%d\n",
+              now.c_str(), label, forward ? "fwd" : "bwd", (long)hr_clone,
+              (long)hr_fwd, cch_fwd, (long)hr_bwd, cch_bwd, (long)hr_ext,
+              rc.left, rc.top, rc.right, rc.bottom, found ? 1 : 0);
     ::fclose(fp);
   }
 
-  if (found)
-    *anchor = candidate;
   return found;
 }
 
@@ -692,10 +708,18 @@ STDMETHODIMP CGetTextExtentEditSession::DoEditSession(TfEditCookie ec) {
     anchored = true;
     source = "gui_thread_info";
   }
-  if (!anchored &&
-      _AnchorFromNeighbourRange(ec, _pContextView, pRange, hwnd_host, &rc)) {
+  if (!anchored && _AnchorFromNeighbourRange(ec, _pContextView, pRange,
+                                             hwnd_host, "compose", &rc)) {
     anchored = true;
-    source = "neighbour_range";
+    source = "neighbour_compose";
+  }
+  /* The composition range may be clamped to the composition extent, so try the
+   * selection range as well: it always points into the document text. */
+  if (!anchored && selection.range != pRange &&
+      _AnchorFromNeighbourRange(ec, _pContextView, selection.range, hwnd_host,
+                                "select", &rc)) {
+    anchored = true;
+    source = "neighbour_select";
   }
   if (!anchored && _AnchorFromCaretPos(hwnd_host, &rc)) {
     anchored = true;
