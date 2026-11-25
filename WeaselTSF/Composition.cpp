@@ -556,17 +556,19 @@ bool _AnchorFromNeighbourRange(TfEditCookie ec,
  * characters in a document. */
 /* Number of characters currently held by a composition, or -1 when the query
  * fails. Only the zero/non-zero distinction matters here. */
-LONG _CompositionLength(TfEditCookie ec, ITfComposition* composition) {
+/* 1 when the composition holds no character, 0 when it holds text, -1 when the
+ * query failed. Uses CompareStart against the range itself, the same call the
+ * text edit sink already relies on. */
+int _CompositionEmpty(TfEditCookie ec, ITfComposition* composition) {
   if (composition == nullptr)
     return -1;
   com_ptr<ITfRange> range;
   if (composition->GetRange(&range) != S_OK || range == nullptr)
     return -1;
-  WCHAR buffer[1] = {};
-  ULONG got = 0;
-  if (range->GetText(ec, 1, buffer, &got) != S_OK)
+  LONG cmp = 0;
+  if (range->CompareStart(ec, range, TF_ANCHOR_END, &cmp) != S_OK)
     return -1;
-  return static_cast<LONG>(got);
+  return cmp == 0 ? 1 : 0;
 }
 
 bool _AnchorFromProbeWrite(TfEditCookie ec,
@@ -581,9 +583,9 @@ bool _AnchorFromProbeWrite(TfEditCookie ec,
   HRESULT hr_set = E_FAIL;
   HRESULT hr_ext = E_FAIL;
   HRESULT hr_clear = E_FAIL;
-  LONG len_before = -1;
-  LONG len_after_set = -1;
-  LONG len_after_clear = -1;
+  int before = -1;
+  int after_set = -1;
+  int after_clear = -1;
 
   do {
     if (disabled.load() || view == nullptr || composition == nullptr)
@@ -593,8 +595,8 @@ bool _AnchorFromProbeWrite(TfEditCookie ec,
      * preedit of another mode and must not be replaced. A failed length query
      * (-1) is tolerated because the whole probe only runs where the cheap
      * extent queries already failed. */
-    len_before = _CompositionLength(ec, composition);
-    if (len_before > 0)
+    before = _CompositionEmpty(ec, composition);
+    if (before == 0)
       break;
 
     com_ptr<ITfRange> comp;
@@ -605,7 +607,7 @@ bool _AnchorFromProbeWrite(TfEditCookie ec,
     if (hr_set != S_OK)
       break;
 
-    len_after_set = _CompositionLength(ec, composition);
+    after_set = _CompositionEmpty(ec, composition);
 
     com_ptr<ITfRange> query;
     if (composition->GetRange(&query) == S_OK && query != nullptr) {
@@ -620,21 +622,21 @@ bool _AnchorFromProbeWrite(TfEditCookie ec,
     if (composition->GetRange(&clean) == S_OK && clean != nullptr)
       hr_clear = clean->SetText(ec, 0, L"", 0);
 
-    len_after_clear = _CompositionLength(ec, composition);
-    if (len_after_clear > 0) {
-      // cch = 0 did not clear it, delete the insertion explicitly.
+    after_clear = _CompositionEmpty(ec, composition);
+    if (after_clear == 0) {
+      // cch = 0 left it behind; exactly one character was inserted.
       com_ptr<ITfRange> clean2;
       if (composition->GetRange(&clean2) == S_OK && clean2 != nullptr) {
-        hr_clear = clean2->SetText(ec, len_after_clear, L"", 0);
-        len_after_clear = _CompositionLength(ec, composition);
+        hr_clear = clean2->SetText(ec, 1, L"", 0);
+        after_clear = _CompositionEmpty(ec, composition);
       }
     }
-    if (len_after_clear > 0) {
-      // Filler left behind: stop probing in this process for good.
+    if (after_clear == 0) {
+      // Filler survived: stop probing in this process for good.
       disabled.store(true);
       break;
     }
-    if (len_after_clear < 0 && hr_clear != S_OK)
+    if (after_clear < 0 && hr_clear != S_OK)
       break;  // could not confirm the filler is gone
     if (hr_ext != S_OK)
       break;
@@ -651,11 +653,11 @@ bool _AnchorFromProbeWrite(TfEditCookie ec,
   if (fp != nullptr) {
     const std::string now = current_time();
     ::fprintf(fp,
-              "%s probe set=0x%lx ext=0x%lx clear=0x%lx len=%ld/%ld/%ld "
+              "%s probe set=0x%lx ext=0x%lx clear=0x%lx empty=%d/%d/%d "
               "rc=(%ld,%ld,%ld,%ld) anchored=%d\n",
-              now.c_str(), (long)hr_set, (long)hr_ext, (long)hr_clear,
-              len_before, len_after_set, len_after_clear, rc.left, rc.top,
-              rc.right, rc.bottom, found ? 1 : 0);
+              now.c_str(), (long)hr_set, (long)hr_ext, (long)hr_clear, before,
+              after_set, after_clear, rc.left, rc.top, rc.right, rc.bottom,
+              found ? 1 : 0);
     ::fclose(fp);
   }
 
