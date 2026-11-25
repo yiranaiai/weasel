@@ -122,7 +122,14 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          .\get-rime.ps1 -use dev
+          # Pin the dev channel explicitly. rime/librime publishes its nightly
+          # builds as a prerelease whose tag is literally "latest". The
+          # /releases/latest endpoint skips prereleases, so as soon as a stable
+          # release is published it returns assets named after the version
+          # (rime-1.18.0-...) which the dev pattern does not match, and the
+          # script then quietly downloads nothing. Asking for the tag directly
+          # keeps resolving to the nightly, as it did before.
+          .\get-rime.ps1 -use dev -tag latest
 
       - name: Build data
         shell: pwsh
