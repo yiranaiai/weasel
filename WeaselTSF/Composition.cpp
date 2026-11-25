@@ -362,23 +362,102 @@ bool _AnchorFromHostWindow(HWND hwnd_host, RECT* anchor) {
  * is raised (HKCU\Software\Rime\Weasel\LogLevel > 0) so the normal path keeps
  * away from the file system. It records which fallback produced the anchor,
  * which is the only way to tell whether a host exposes a caret at all. */
-void _TraceAnchor(const char* source, const RECT& rc) {
+/* Trace sink. Only active while the Weasel log level is raised
+ * (HKCU\Software\Rime\Weasel\LogLevel > 0) so the normal path stays away from
+ * the file system. It records every source the anchor chain consults, because
+ * for a self drawn host such as WPS Writer the only way to tell what it does
+ * expose is to write the numbers down. */
+FILE* _OpenTraceFile() {
   if (!IsWeaselLogEnabled())
-    return;
-
+    return nullptr;
   wchar_t path[MAX_PATH] = {};
   const DWORD len = ::GetTempPathW(MAX_PATH, path);
   constexpr size_t suffix_len = 18;  // "weasel-anchor.log" plus the NUL
   if (len == 0 || len + suffix_len > MAX_PATH)
-    return;
+    return nullptr;
   ::lstrcatW(path, L"weasel-anchor.log");
-
   FILE* fp = nullptr;
-  if (::_wfopen_s(&fp, path, L"a") != 0 || fp == nullptr)
+  if (::_wfopen_s(&fp, path, L"a") != 0)
+    return nullptr;
+  return fp;
+}
+
+void _TraceDiag(HRESULT hr_ext,
+                const RECT& ext_rc,
+                BOOL ext_clipped,
+                HRESULT hr_sel,
+                const RECT& sel_rc,
+                ITfContextView* view,
+                HWND hwnd_host,
+                const char* source,
+                const RECT& final_rc) {
+  FILE* fp = _OpenTraceFile();
+  if (fp == nullptr)
     return;
+
+  RECT view_rect = {};
+  HRESULT hr_view = E_FAIL;
+  if (view != nullptr)
+    hr_view = view->GetScreenExt(&view_rect);
+
+  HWND host = _CaretHostWindow(hwnd_host);
+  HWND caret_hwnd = nullptr;
+  RECT caret_rect = {};
+  if (host != nullptr) {
+    const DWORD tid = ::GetWindowThreadProcessId(host, nullptr);
+    GUITHREADINFO info = {};
+    info.cbSize = sizeof(info);
+    if (tid != 0 && ::GetGUIThreadInfo(tid, &info)) {
+      caret_hwnd = info.hwndCaret;
+      caret_rect = info.rcCaret;
+    }
+  }
+
+  POINT caret_pos = {};
+  const BOOL has_caret_pos = ::GetCaretPos(&caret_pos);
+
+  COMPOSITIONFORM form = {};
+  BOOL has_form = FALSE;
+  const Imm32Api& api = _Imm32();
+  if (api.usable() && host != nullptr) {
+    HIMC himc = api.get_context(host);
+    if (himc != nullptr) {
+      has_form = api.get_composition_window(himc, &form);
+      api.release_context(host, himc);
+    }
+  }
+
+  RECT host_rect = {};
+  if (host != nullptr)
+    ::GetWindowRect(host, &host_rect);
+
+  std::ostringstream line;
+  line << "text_ext hr=0x" << std::hex << (long)hr_ext << std::dec << " rc=("
+       << ext_rc.left << "," << ext_rc.top << "," << ext_rc.right << ","
+       << ext_rc.bottom << ") clipped=" << (ext_clipped ? 1 : 0)
+       << " | sel_ext hr=0x" << std::hex << (long)hr_sel << std::dec << " rc=("
+       << sel_rc.left << "," << sel_rc.top << "," << sel_rc.right << ","
+       << sel_rc.bottom << ")"
+       << " | screen_ext hr=0x" << std::hex << (long)hr_view << std::dec
+       << " rc=(" << view_rect.left << "," << view_rect.top << ","
+       << view_rect.right << "," << view_rect.bottom << ")"
+       << " | hwnd=0x" << std::hex << (unsigned long long)host << " win=("
+       << std::dec << host_rect.left << "," << host_rect.top << ","
+       << host_rect.right << "," << host_rect.bottom << ")"
+       << " | gui caret=0x" << std::hex << (unsigned long long)caret_hwnd
+       << " rc=(" << std::dec << caret_rect.left << "," << caret_rect.top << ","
+       << caret_rect.right << "," << caret_rect.bottom << ")"
+       << " | caretpos ok=" << (has_caret_pos ? 1 : 0) << " pt=(" << caret_pos.x
+       << "," << caret_pos.y << ")"
+       << " | imm has=" << (has_form ? 1 : 0) << " style=0x" << std::hex
+       << form.dwStyle << std::dec << " pt=(" << form.ptCurrentPos.x << ","
+       << form.ptCurrentPos.y << ")"
+       << " | source=" << source << " final=(" << final_rc.left << ","
+       << final_rc.top << "," << final_rc.right << "," << final_rc.bottom
+       << ")";
+
   const std::string now = current_time();
-  ::fprintf(fp, "%s source=%s rc=(%ld,%ld,%ld,%ld)\n", now.c_str(), source,
-            rc.left, rc.top, rc.right, rc.bottom);
+  ::fprintf(fp, "%s %s\n", now.c_str(), line.str().c_str());
   ::fclose(fp);
 }
 
@@ -469,7 +548,7 @@ STDMETHODIMP CGetTextExtentEditSession::DoEditSession(TfEditCookie ec) {
   com_ptr<ITfRange> pRangeComposition;
   ITfRange* pRange;
   RECT rc = {0, 0, 1, 1};
-  BOOL fClipped;
+  BOOL fClipped = FALSE;
   TF_SELECTION selection;
   ULONG nSelection;
 
@@ -492,9 +571,16 @@ STDMETHODIMP CGetTextExtentEditSession::DoEditSession(TfEditCookie ec) {
   if (_pContextView != nullptr)
     _pContextView->GetWnd(&hwnd_host);
 
+  HRESULT hr_ext = E_FAIL;
+  BOOL ext_clipped = FALSE;
+  RECT ext_rc = {0, 0, 1, 1};
+  if (_pContextView != nullptr)
+    hr_ext = _pContextView->GetTextExt(ec, pRange, &rc, &fClipped);
+  ext_rc = rc;
+  ext_clipped = fClipped;
+
   bool anchored = false;
-  if ((_pContextView->GetTextExt(ec, pRange, &rc, &fClipped)) == S_OK &&
-      (rc.left != 0 || rc.top != 0)) {
+  if (hr_ext == S_OK && (rc.left != 0 || rc.top != 0)) {
     // get the foreground window pos and check if rc from GetTextExt is out of
     // window
     if (_enhancedPosition) {
@@ -518,6 +604,17 @@ STDMETHODIMP CGetTextExtentEditSession::DoEditSession(TfEditCookie ec) {
       }
     }
     anchored = _IsAnchorUsable(rc, hwnd_host);
+  }
+
+  /* Diagnostic only, never used for positioning: does this host answer for the
+   * selection range even when it refuses the composition range? */
+  HRESULT hr_sel = E_FAIL;
+  RECT sel_rc = {0, 0, 1, 1};
+  if (IsWeaselLogEnabled() && _pContextView != nullptr &&
+      selection.range != nullptr && selection.range != pRange) {
+    BOOL sel_clipped = FALSE;
+    hr_sel =
+        _pContextView->GetTextExt(ec, selection.range, &sel_rc, &sel_clipped);
   }
 
   /* WPS Writer/Presentation never answer GetTextExt, and some hosts return a
@@ -549,9 +646,10 @@ STDMETHODIMP CGetTextExtentEditSession::DoEditSession(TfEditCookie ec) {
   /* Always report a position: while a composition is active the candidate
    * window is only published from here. Skipping the call leaves the window
    * invisible instead of merely misplaced. */
-  _TraceAnchor(source, rc);
   _ClampAnchor(rc);
   _RememberAnchor(rc);
+  _TraceDiag(hr_ext, ext_rc, ext_clipped, hr_sel, sel_rc, _pContextView,
+             hwnd_host, source, rc);
   _pTextService->_SetCompositionPosition(rc);
   return S_OK;
 }
