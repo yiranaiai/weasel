@@ -145,10 +145,13 @@ void WeaselTSF::_EndComposition(com_ptr<ITfContext> pContext,
  * helpers below build a fallback chain so a usable screen-space anchor is
  * nearly always available:
  *
- *   1. GetTextExt (normal path)
+ *   1. GetTextExt, accepted only when it overlaps the host window
  *   2. GUITHREADINFO::rcCaret of the host UI thread
- *   3. the IMM32 composition window position
- *   4. the last anchor that was actually reported
+ *   3. GetTextExt on a neighbour range, for hosts that refuse a collapsed one
+ *   4. GetCaretPos() of the calling thread
+ *   5. the IMM32 composition window position
+ *   6. the last anchor that was actually reported
+ *   7. the host window origin, which always exists
  *
  * All rects are screen coordinates in physical pixels: Weasel is per-monitor
  * DPI aware and every API used here already reports physical pixels, so no
@@ -316,6 +319,11 @@ bool _AnchorFromCaretPos(HWND hwnd_host, RECT* anchor) {
   POINT caret = {};
   if (!::GetCaretPos(&caret))
     return false;
+  // Hosts that never set a caret still report success with (0, 0), which would
+  // anchor the window at the client origin. Treat it as "no caret" instead: the
+  // terminal fallback produces the same point when the caret really is there.
+  if (caret.x == 0 && caret.y == 0)
+    return false;
   // The thread caret lives in client coordinates of the thread window.
   POINT top_left = caret;
   if (!::ClientToScreen(hwnd, &top_left))
@@ -459,6 +467,62 @@ void _TraceDiag(HRESULT hr_ext,
   const std::string now = current_time();
   ::fprintf(fp, "%s %s\n", now.c_str(), line.str().c_str());
   ::fclose(fp);
+}
+
+/* Ask GetTextExt for a range that actually contains text.
+ *
+ * Some hosts refuse to map a collapsed range to a layout but answer as soon as
+ * the range covers a character. WPS Writer behaves this way: with inline
+ * preedit the composition carries the preedit string and the candidate window
+ * follows the caret, while an empty composition leaves it parked. Widen the
+ * range by one character and take the edge that faces the caret. */
+bool _AnchorFromNeighbourRange(TfEditCookie ec,
+                               ITfContextView* view,
+                               ITfRange* range,
+                               HWND hwnd_host,
+                               RECT* anchor) {
+  if (view == nullptr || range == nullptr)
+    return false;
+
+  com_ptr<ITfRange> probe;
+  if (range->Clone(&probe) != S_OK || probe == nullptr)
+    return false;
+
+  LONG shifted = 0;
+  bool forward = true;
+  if (probe->ShiftEnd(ec, 1, &shifted, nullptr) != S_OK || shifted <= 0) {
+    forward = false;
+    if (probe->ShiftStart(ec, -1, &shifted, nullptr) != S_OK || shifted == 0)
+      return false;
+  }
+
+  RECT rc = {};
+  BOOL clipped = FALSE;
+  const HRESULT hr = view->GetTextExt(ec, probe, &rc, &clipped);
+
+  bool found = false;
+  RECT candidate = {};
+  if (hr == S_OK) {
+    const int height = rc.bottom > rc.top ? rc.bottom - rc.top : 1;
+    if (forward)
+      candidate = {rc.left, rc.top, rc.left, rc.top + height};
+    else
+      candidate = {rc.right, rc.top, rc.right, rc.top + height};
+    found = _IsAnchorUsable(candidate, hwnd_host);
+  }
+
+  FILE* fp = _OpenTraceFile();
+  if (fp != nullptr) {
+    const std::string now = current_time();
+    ::fprintf(fp, "%s neigh dir=%s hr=0x%lx rc=(%ld,%ld,%ld,%ld) anchored=%d\n",
+              now.c_str(), forward ? "fwd" : "bwd", (long)hr, rc.left, rc.top,
+              rc.right, rc.bottom, found ? 1 : 0);
+    ::fclose(fp);
+  }
+
+  if (found)
+    *anchor = candidate;
+  return found;
 }
 
 /* Last anchor that was reported to the UI. Deliberately per process: a stale
@@ -617,14 +681,21 @@ STDMETHODIMP CGetTextExtentEditSession::DoEditSession(TfEditCookie ec) {
         _pContextView->GetTextExt(ec, selection.range, &sel_rc, &sel_clipped);
   }
 
-  /* WPS Writer/Presentation never answer GetTextExt, and some hosts return a
+  /* WPS Writer/Presentation never answer GetTextExt for the empty composition
+   * that preedit_type = composition creates, and some hosts return a
    * degenerate rect. Fall back to the caret exposed by the host UI thread,
-   * then to the thread caret, the IMM32 composition window, the previous
-   * anchor, and finally a position that is always available. */
+   * then to a neighbour range that carries text, the thread caret, the IMM32
+   * composition window, the previous anchor, and finally a position that is
+   * always available. */
   const char* source = "text_ext";
   if (!anchored && _AnchorFromCaret(hwnd_host, &rc)) {
     anchored = true;
     source = "gui_thread_info";
+  }
+  if (!anchored &&
+      _AnchorFromNeighbourRange(ec, _pContextView, pRange, hwnd_host, &rc)) {
+    anchored = true;
+    source = "neighbour_range";
   }
   if (!anchored && _AnchorFromCaretPos(hwnd_host, &rc)) {
     anchored = true;
