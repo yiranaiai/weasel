@@ -148,10 +148,12 @@ void WeaselTSF::_EndComposition(com_ptr<ITfContext> pContext,
  *   1. GetTextExt, accepted only when it overlaps the host window
  *   2. GUITHREADINFO::rcCaret of the host UI thread
  *   3. GetTextExt on a neighbour range, for hosts that refuse a collapsed one
- *   4. GetCaretPos() of the calling thread
- *   5. the IMM32 composition window position
- *   6. the last anchor that was actually reported
- *   7. the host window origin, which always exists
+ *   4. GetTextExt on our composition after a temporary invisible filler, for
+ *      hosts that report no extent unless the range carries a character
+ *   5. GetCaretPos() of the calling thread
+ *   6. the IMM32 composition window position
+ *   7. the last anchor that was actually reported
+ *   8. the host window origin, which always exists
  *
  * All rects are screen coordinates in physical pixels: Weasel is per-monitor
  * DPI aware and every API used here already reports physical pixels, so no
@@ -541,6 +543,125 @@ bool _AnchorFromNeighbourRange(TfEditCookie ec,
   return found;
 }
 
+/* Some hosts keep no document text in their TSF store: they only report a text
+ * extent for a range that carries characters. WPS Writer is one of them - an
+ * empty composition gets the work area corner back, while a composition with
+ * text gets the real caret. Borrow the mechanism: put one zero width space
+ * into our own composition, read the extent, then take it back out. Both
+ * writes happen inside a single edit session, so the application observes only
+ * the final empty composition.
+ *
+ * The filler is read back every time. If it cannot be removed the probe
+ * disables itself for the process rather than risk leaving invisible
+ * characters in a document. */
+/* Number of characters currently held by a composition, or -1 when the query
+ * fails. Only the zero/non-zero distinction matters here. */
+LONG _CompositionLength(TfEditCookie ec, ITfComposition* composition) {
+  if (composition == nullptr)
+    return -1;
+  com_ptr<ITfRange> range;
+  if (composition->GetRange(&range) != S_OK || range == nullptr)
+    return -1;
+  WCHAR buffer[1] = {};
+  ULONG got = 0;
+  if (range->GetText(ec, 1, buffer, &got) != S_OK)
+    return -1;
+  return static_cast<LONG>(got);
+}
+
+bool _AnchorFromProbeWrite(TfEditCookie ec,
+                           ITfContextView* view,
+                           ITfComposition* composition,
+                           HWND hwnd_host,
+                           RECT* anchor) {
+  static std::atomic<bool> disabled{false};
+
+  bool found = false;
+  RECT rc = {};
+  HRESULT hr_set = E_FAIL;
+  HRESULT hr_ext = E_FAIL;
+  HRESULT hr_clear = E_FAIL;
+  LONG len_before = -1;
+  LONG len_after_set = -1;
+  LONG len_after_clear = -1;
+
+  do {
+    if (disabled.load() || view == nullptr || composition == nullptr)
+      break;
+
+    /* Never touch a composition that already holds text: that text is the
+     * preedit of another mode and must not be replaced. A failed length query
+     * (-1) is tolerated because the whole probe only runs where the cheap
+     * extent queries already failed. */
+    len_before = _CompositionLength(ec, composition);
+    if (len_before > 0)
+      break;
+
+    com_ptr<ITfRange> comp;
+    if (composition->GetRange(&comp) != S_OK || comp == nullptr)
+      break;
+
+    hr_set = comp->SetText(ec, 0, L"\u200B", 1);
+    if (hr_set != S_OK)
+      break;
+
+    len_after_set = _CompositionLength(ec, composition);
+
+    com_ptr<ITfRange> query;
+    if (composition->GetRange(&query) == S_OK && query != nullptr) {
+      BOOL clipped = FALSE;
+      hr_ext = view->GetTextExt(ec, query, &rc, &clipped);
+    }
+
+    /* Take the filler back out before anything else, on success and on
+     * failure alike, then verify against the composition itself rather than
+     * the range we kept. */
+    com_ptr<ITfRange> clean;
+    if (composition->GetRange(&clean) == S_OK && clean != nullptr)
+      hr_clear = clean->SetText(ec, 0, L"", 0);
+
+    len_after_clear = _CompositionLength(ec, composition);
+    if (len_after_clear > 0) {
+      // cch = 0 did not clear it, delete the insertion explicitly.
+      com_ptr<ITfRange> clean2;
+      if (composition->GetRange(&clean2) == S_OK && clean2 != nullptr) {
+        hr_clear = clean2->SetText(ec, len_after_clear, L"", 0);
+        len_after_clear = _CompositionLength(ec, composition);
+      }
+    }
+    if (len_after_clear > 0) {
+      // Filler left behind: stop probing in this process for good.
+      disabled.store(true);
+      break;
+    }
+    if (len_after_clear < 0 && hr_clear != S_OK)
+      break;  // could not confirm the filler is gone
+    if (hr_ext != S_OK)
+      break;
+
+    const int height = rc.bottom > rc.top ? rc.bottom - rc.top : 1;
+    RECT candidate = {rc.left, rc.top, rc.left, rc.top + height};
+    if (_IsAnchorUsable(candidate, hwnd_host)) {
+      *anchor = candidate;
+      found = true;
+    }
+  } while (false);
+
+  FILE* fp = _OpenTraceFile();
+  if (fp != nullptr) {
+    const std::string now = current_time();
+    ::fprintf(fp,
+              "%s probe set=0x%lx ext=0x%lx clear=0x%lx len=%ld/%ld/%ld "
+              "rc=(%ld,%ld,%ld,%ld) anchored=%d\n",
+              now.c_str(), (long)hr_set, (long)hr_ext, (long)hr_clear,
+              len_before, len_after_set, len_after_clear, rc.left, rc.top,
+              rc.right, rc.bottom, found ? 1 : 0);
+    ::fclose(fp);
+  }
+
+  return found;
+}
+
 /* Last anchor that was reported to the UI. Deliberately per process: a stale
  * caret position is still a better guess than the bottom-right default. */
 struct AnchorStore {
@@ -721,6 +842,13 @@ STDMETHODIMP CGetTextExtentEditSession::DoEditSession(TfEditCookie ec) {
     anchored = true;
     source = "neighbour_select";
   }
+  /* Hosts that expose no text at all still answer for a range that carries a
+   * character, so borrow our own composition for the query. */
+  if (!anchored && _pComposition != nullptr &&
+      _AnchorFromProbeWrite(ec, _pContextView, _pComposition, hwnd_host, &rc)) {
+    anchored = true;
+    source = "probe_write";
+  }
   if (!anchored && _AnchorFromCaretPos(hwnd_host, &rc)) {
     anchored = true;
     source = "caret_pos";
@@ -761,9 +889,17 @@ BOOL WeaselTSF::_UpdateCompositionWindow(com_ptr<ITfContext> pContext) {
   if (pEditSession == NULL) {
     return FALSE;
   }
-  HRESULT hr;
+  /* Read and write: the extent session may need to put a filler character into
+   * the composition to obtain a position from hosts that do not report one for
+   * an empty range. A document that refuses writes still gets positioned, just
+   * without that probe. */
+  HRESULT hr = E_FAIL;
   pContext->RequestEditSession(_tfClientId, pEditSession,
-                               TF_ES_ASYNCDONTCARE | TF_ES_READ, &hr);
+                               TF_ES_ASYNCDONTCARE | TF_ES_READWRITE, &hr);
+  if (FAILED(hr)) {
+    pContext->RequestEditSession(_tfClientId, pEditSession,
+                                 TF_ES_ASYNCDONTCARE | TF_ES_READ, &hr);
+  }
   return SUCCEEDED(hr);
 }
 
