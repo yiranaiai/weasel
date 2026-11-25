@@ -5,6 +5,7 @@
 #include "CandidateList.h"
 
 #include <imm.h>
+#include <stdio.h>
 
 /* Start Composition */
 class CStartCompositionEditSession : public CEditSession {
@@ -304,6 +305,83 @@ bool _AnchorFromImm32(HWND hwnd_host, RECT* anchor) {
   return found;
 }
 
+/* Caret position of the calling thread. GetCaretPos() works for hosts that
+ * keep a thread caret but never fill GUITHREADINFO::hwndCaret, which is common
+ * when the app draws the caret itself. */
+bool _AnchorFromCaretPos(HWND hwnd_host, RECT* anchor) {
+  HWND hwnd = _CaretHostWindow(hwnd_host);
+  if (hwnd == nullptr)
+    return false;
+
+  POINT caret = {};
+  if (!::GetCaretPos(&caret))
+    return false;
+  // The thread caret lives in client coordinates of the thread window.
+  POINT top_left = caret;
+  if (!::ClientToScreen(hwnd, &top_left))
+    return false;
+
+  const RECT rc = {top_left.x, top_left.y, top_left.x, top_left.y + 1};
+  if (!_IsAnchorUsable(rc, hwnd_host))
+    return false;
+  *anchor = rc;
+  return true;
+}
+
+/* Last resort, and it must always succeed.
+ *
+ * While a composition is active the candidate window is published from
+ * _SetCompositionPosition(), so returning without an anchor does not mean
+ * "keep the old position" - it means the window is never shown at all. A
+ * rough anchor that is guaranteed to be on screen beats a well validated
+ * one that does not exist. */
+bool _AnchorFromHostWindow(HWND hwnd_host, RECT* anchor) {
+  HWND hwnd = _CaretHostWindow(hwnd_host);
+  if (hwnd != nullptr) {
+    POINT origin = {0, 0};
+    if (::ClientToScreen(hwnd, &origin)) {
+      *anchor = {origin.x, origin.y, origin.x + 1, origin.y + 1};
+      return true;
+    }
+    RECT window;
+    if (::GetWindowRect(hwnd, &window) && window.right > window.left &&
+        window.bottom > window.top) {
+      *anchor = {window.left, window.top, window.left + 1, window.top + 1};
+      return true;
+    }
+  }
+  POINT cursor = {};
+  if (::GetCursorPos(&cursor)) {
+    *anchor = {cursor.x, cursor.y, cursor.x + 1, cursor.y + 1};
+    return true;
+  }
+  return false;
+}
+
+/* Diagnostic sink for the anchor chain. Only active while the Weasel log level
+ * is raised (HKCU\Software\Rime\Weasel\LogLevel > 0) so the normal path keeps
+ * away from the file system. It records which fallback produced the anchor,
+ * which is the only way to tell whether a host exposes a caret at all. */
+void _TraceAnchor(const char* source, const RECT& rc) {
+  if (!IsWeaselLogEnabled())
+    return;
+
+  wchar_t path[MAX_PATH] = {};
+  const DWORD len = ::GetTempPathW(MAX_PATH, path);
+  constexpr size_t suffix_len = 18;  // "weasel-anchor.log" plus the NUL
+  if (len == 0 || len + suffix_len > MAX_PATH)
+    return;
+  ::lstrcatW(path, L"weasel-anchor.log");
+
+  FILE* fp = nullptr;
+  if (::_wfopen_s(&fp, path, L"a") != 0 || fp == nullptr)
+    return;
+  const std::string now = current_time();
+  ::fprintf(fp, "%s source=%s rc=(%ld,%ld,%ld,%ld)\n", now.c_str(), source,
+            rc.left, rc.top, rc.right, rc.bottom);
+  ::fclose(fp);
+}
+
 /* Last anchor that was reported to the UI. Deliberately per process: a stale
  * caret position is still a better guess than the bottom-right default. */
 struct AnchorStore {
@@ -390,7 +468,7 @@ STDMETHODIMP CGetTextExtentEditSession::DoEditSession(TfEditCookie ec) {
   com_ptr<ITfInsertAtSelection> pInsertAtSelection;
   com_ptr<ITfRange> pRangeComposition;
   ITfRange* pRange;
-  RECT rc;
+  RECT rc = {0, 0, 1, 1};
   BOOL fClipped;
   TF_SELECTION selection;
   ULONG nSelection;
@@ -444,19 +522,37 @@ STDMETHODIMP CGetTextExtentEditSession::DoEditSession(TfEditCookie ec) {
 
   /* WPS Writer/Presentation never answer GetTextExt, and some hosts return a
    * degenerate rect. Fall back to the caret exposed by the host UI thread,
-   * then to the IMM32 composition window, then to the previous anchor. */
-  if (!anchored)
-    anchored = _AnchorFromCaret(hwnd_host, &rc);
-  if (!anchored)
-    anchored = _AnchorFromImm32(hwnd_host, &rc);
-  if (!anchored)
-    anchored = _LastAnchor(&rc);
-
-  if (anchored) {
-    _ClampAnchor(rc);
-    _RememberAnchor(rc);
-    _pTextService->_SetCompositionPosition(rc);
+   * then to the thread caret, the IMM32 composition window, the previous
+   * anchor, and finally a position that is always available. */
+  const char* source = "text_ext";
+  if (!anchored && _AnchorFromCaret(hwnd_host, &rc)) {
+    anchored = true;
+    source = "gui_thread_info";
   }
+  if (!anchored && _AnchorFromCaretPos(hwnd_host, &rc)) {
+    anchored = true;
+    source = "caret_pos";
+  }
+  if (!anchored && _AnchorFromImm32(hwnd_host, &rc)) {
+    anchored = true;
+    source = "imm32";
+  }
+  if (!anchored && _LastAnchor(&rc)) {
+    anchored = true;
+    source = "last_anchor";
+  }
+  if (!anchored && _AnchorFromHostWindow(hwnd_host, &rc)) {
+    anchored = true;
+    source = "host_window";
+  }
+
+  /* Always report a position: while a composition is active the candidate
+   * window is only published from here. Skipping the call leaves the window
+   * invisible instead of merely misplaced. */
+  _TraceAnchor(source, rc);
+  _ClampAnchor(rc);
+  _RememberAnchor(rc);
+  _pTextService->_SetCompositionPosition(rc);
   return S_OK;
 }
 
