@@ -775,106 +775,37 @@ STDMETHODIMP CGetTextExtentEditSession::DoEditSession(TfEditCookie ec) {
     _pContextView->GetWnd(&hwnd_host);
 
   HRESULT hr_ext = E_FAIL;
-  BOOL ext_clipped = FALSE;
-  RECT ext_rc = {0, 0, 1, 1};
   if (_pContextView != nullptr)
     hr_ext = _pContextView->GetTextExt(ec, pRange, &rc, &fClipped);
-  ext_rc = rc;
-  ext_clipped = fClipped;
 
-  bool anchored = false;
-  if (hr_ext == S_OK && (rc.left != 0 || rc.top != 0)) {
+  if (hr_ext == S_OK && _enhancedPosition) {
     // get the foreground window pos and check if rc from GetTextExt is out of
     // window
-    if (_enhancedPosition) {
-      HWND hwnd = hwnd_host != nullptr ? hwnd_host : ::GetForegroundWindow();
-      RECT rcForegroundWindow;
-      if (hwnd != nullptr && ::GetWindowRect(hwnd, &rcForegroundWindow)) {
-        if (rc.left < rcForegroundWindow.left ||
-            rc.left > rcForegroundWindow.right ||
-            rc.top < rcForegroundWindow.top ||
-            rc.top > rcForegroundWindow.bottom) {
-          POINT pt;
-          bool hasCaret = ::GetCaretPos(&pt);
-          int offsetx =
-              rcForegroundWindow.left - rc.left + (hasCaret ? pt.x : 0);
-          int offsety = rcForegroundWindow.top - rc.top + (hasCaret ? pt.y : 0);
-          rc.left += offsetx;
-          rc.right += offsetx;
-          rc.top += offsety;
-          rc.bottom += offsety;
-        }
+    HWND hwnd = hwnd_host != nullptr ? hwnd_host : ::GetForegroundWindow();
+    RECT rcForegroundWindow;
+    if (hwnd != nullptr && ::GetWindowRect(hwnd, &rcForegroundWindow)) {
+      if (rc.left < rcForegroundWindow.left ||
+          rc.left > rcForegroundWindow.right ||
+          rc.top < rcForegroundWindow.top ||
+          rc.top > rcForegroundWindow.bottom) {
+        POINT pt;
+        bool hasCaret = ::GetCaretPos(&pt);
+        int offsetx = rcForegroundWindow.left - rc.left + (hasCaret ? pt.x : 0);
+        int offsety = rcForegroundWindow.top - rc.top + (hasCaret ? pt.y : 0);
+        rc.left += offsetx;
+        rc.right += offsetx;
+        rc.top += offsety;
+        rc.bottom += offsety;
       }
     }
-    anchored = _IsAnchorUsable(rc, hwnd_host);
   }
 
-  /* Diagnostic only, never used for positioning: does this host answer for the
-   * selection range even when it refuses the composition range? */
-  HRESULT hr_sel = E_FAIL;
-  RECT sel_rc = {0, 0, 1, 1};
-  if (IsWeaselLogEnabled() && _pContextView != nullptr &&
-      selection.range != nullptr && selection.range != pRange) {
-    BOOL sel_clipped = FALSE;
-    hr_sel =
-        _pContextView->GetTextExt(ec, selection.range, &sel_rc, &sel_clipped);
-  }
-
-  /* WPS Writer/Presentation never answer GetTextExt for the empty composition
-   * that preedit_type = composition creates, and some hosts return a
-   * degenerate rect. Fall back to the caret exposed by the host UI thread,
-   * then to a neighbour range that carries text, the thread caret, the IMM32
-   * composition window, the previous anchor, and finally a position that is
-   * always available. */
-  const char* source = "text_ext";
-  if (!anchored && _AnchorFromCaret(hwnd_host, &rc)) {
-    anchored = true;
-    source = "gui_thread_info";
-  }
-  if (!anchored && _AnchorFromNeighbourRange(ec, _pContextView, pRange,
-                                             hwnd_host, "compose", &rc)) {
-    anchored = true;
-    source = "neighbour_compose";
-  }
-  /* The composition range may be clamped to the composition extent, so try the
-   * selection range as well: it always points into the document text. */
-  if (!anchored && selection.range != pRange &&
-      _AnchorFromNeighbourRange(ec, _pContextView, selection.range, hwnd_host,
-                                "select", &rc)) {
-    anchored = true;
-    source = "neighbour_select";
-  }
-  /* Hosts that expose no text at all still answer for a range that carries a
-   * character, so borrow our own composition for the query. */
-  if (!anchored && _pComposition != nullptr &&
-      _AnchorFromProbeWrite(ec, _pContextView, _pComposition, hwnd_host, &rc)) {
-    anchored = true;
-    source = "probe_write";
-  }
-  if (!anchored && _AnchorFromCaretPos(hwnd_host, &rc)) {
-    anchored = true;
-    source = "caret_pos";
-  }
-  if (!anchored && _AnchorFromImm32(hwnd_host, &rc)) {
-    anchored = true;
-    source = "imm32";
-  }
-  if (!anchored && _LastAnchor(&rc)) {
-    anchored = true;
-    source = "last_anchor";
-  }
-  if (!anchored && _AnchorFromHostWindow(hwnd_host, &rc)) {
-    anchored = true;
-    source = "host_window";
-  }
-
-  /* Always report a position: while a composition is active the candidate
-   * window is only published from here. Skipping the call leaves the window
-   * invisible instead of merely misplaced. */
-  _ClampAnchor(rc);
-  _RememberAnchor(rc);
-  _TraceDiag(hr_ext, ext_rc, ext_clipped, hr_sel, sel_rc, _pContextView,
-             hwnd_host, source, rc);
+  /* Report exactly the rect the host reported. Hosts that paint their own caret
+   * (WPS Writer) answer with a rect that points nowhere useful, but the server
+   * knows their real caret and _SetCompositionPosition overrides it there. For
+   * every other host the rect above is the correct answer: second-guessing it
+   * here (thread caret, neighbour range, remembered anchor, window corner) is
+   * what made text boxes in other applications jump to the window corner. */
   _pTextService->_SetCompositionPosition(rc);
   return S_OK;
 }
