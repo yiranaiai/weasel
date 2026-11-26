@@ -9,6 +9,7 @@
 #include <WeaselUI.h>
 #include <RimeWithWeasel.h>
 #include <WeaselUtility.h>
+#include <WpsAnchor.h>
 #include <winsparkle.h>
 #include <functional>
 #include <ShellScalingApi.h>
@@ -82,6 +83,13 @@ int WINAPI _tWinMain(HINSTANCE hInstance,
       else
         client.TrayCommand(ID_WEASELTRAY_DISABLE_ASCII);
     }
+    return 0;
+  }
+
+  // diagnostic: sample the WPS Writer caret anchor without starting the server,
+  // so the provider can be checked on a real desktop before it goes live
+  if (!_wcsicmp(lpstrCmdLine, L"/wps-anchor-probe")) {
+    weasel::wps_anchor::RunProbe(60);
     return 0;
   }
 

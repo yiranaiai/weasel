@@ -4,6 +4,7 @@
 #include <Windows.h>
 #include <resource.h>
 #include <WeaselUtility.h>
+#include <WpsAnchor.h>
 
 namespace weasel {
 class PipeServer : public PipeChannel<DWORD, PipeMessage> {
@@ -291,6 +292,37 @@ DWORD ServerImpl::OnUpdateInputPosition(WEASEL_IPC_COMMAND uMsg,
   int height = ((wParam >> 24) & 0x7f) << hi_res;
   rc.right = rc.left + width;
   rc.bottom = rc.top + height;
+
+  // WPS Writer paints its own caret and, while the composition is empty, does
+  // not map it onto any text: its TSF text store answers with a corner of the
+  // document window, which is inside the window and therefore looks plausible.
+  // Its automation model still reports the caret the user sees; the reader
+  // keeps that answer cached and refreshed in the background, because Writer
+  // does not answer while it is waiting for an IME reply. When both agree (the
+  // usual case, e.g. inline composition) keep what the client sent, so a
+  // correct answer never gets jitter.
+  {
+    HWND doc_window = nullptr;
+    if (wps_anchor::Enabled() && wps_anchor::TargetIsWriter(&doc_window)) {
+      RECT caret = {};
+      if (wps_anchor::LatestAnchor(doc_window, &caret)) {
+        const bool agree = caret.left >= rc.left - 3 &&
+                           caret.left <= rc.left + 3 &&
+                           caret.top >= rc.top - 3 && caret.top <= rc.top + 3;
+        if (!agree) {
+          static DWORD s_last_log = 0;
+          const DWORD now = ::GetTickCount();
+          if (now - s_last_log > 1000) {
+            s_last_log = now;
+            LOG(INFO) << "wps anchor override tsf=(" << rc.left << "," << rc.top
+                      << ") wps=(" << caret.left << "," << caret.top
+                      << ",h=" << (caret.bottom - caret.top) << ")";
+          }
+          rc = caret;
+        }
+      }
+    }
+  }
 
   {
     using PPTLPFPMDPI = BOOL(WINAPI*)(HWND, LPPOINT);

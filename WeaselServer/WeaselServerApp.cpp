@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "WeaselServerApp.h"
+#include <WpsAnchor.h>
 #include <filesystem>
 
 WeaselServerApp::WeaselServerApp()
@@ -14,6 +15,10 @@ WeaselServerApp::WeaselServerApp()
 WeaselServerApp::~WeaselServerApp() {}
 
 int WeaselServerApp::Run() {
+  // The WPS caret lookup runs on its own thread; starting it now keeps the
+  // first keystroke in a WPS document off the cold-start path.
+  weasel::wps_anchor::WarmUp();
+
   LOG(INFO) << "starting IPC server window";
   if (!m_server.Start()) {
     LOG(ERROR) << "failed to start IPC server window";
