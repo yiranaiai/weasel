@@ -601,8 +601,9 @@ int _CompositionEmpty(TfEditCookie ec, ITfComposition* composition) {
  * inside the same session always comes back as the corner sentinel, which is
  * exactly what WPS Writer and Presentation do. So arm the probe here and let
  * the next update read the extent in its own session (see
- * CProbeMeasureEditSession). A zero width space is invisible, so the extra
- * character cannot be seen while it waits.
+ * CProbeMeasureEditSession). The filler is a plain space - it carries an
+ * advance width, which is what layout needs, and no ink, so it cannot be seen
+ * while it waits.
  *
  * A composition that holds text is never overwritten: under
  * preedit_type = inline that text is the preedit of this very service. A
@@ -631,7 +632,11 @@ bool _ArmProbeWrite(TfEditCookie ec,
   com_ptr<ITfRange> range;
   if (composition->GetRange(&range) != S_OK || range == nullptr)
     return false;
-  if (range->SetText(ec, 0, L"\u200B", 1) != S_OK)
+  /* A space, not a zero width space: a host that lays out composition text
+   * still has to give this character an advance width, and a space has no ink,
+   * so it stays invisible even if the host paints the filler before the
+   * measurement session removes it. */
+  if (range->SetText(ec, 0, L" ", 1) != S_OK)
     return false;
 
   /* Present the filler exactly like an inline preedit, because that is the only
