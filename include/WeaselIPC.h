@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include <WeaselIPCData.h>
 #include <WeaselUtility.h>
 #include <windows.h>
@@ -51,6 +51,61 @@ struct IPCMetadata {
   UINT32 server_hwnd;
   WCHAR server_window_class[WINDOW_CLASS_LENGTH];
 };
+
+/*
+ * Caret rect codec shared by both ends of the pipe. The rect travels as one
+ * DWORD: bit 31 marks half-resolution values so coordinates outside +-2048
+ * still fit, then 7 bits of height and 12 signed bits each for left and top.
+ * ClientImpl::UpdateInputPosition packs the request with the same bit layout;
+ * the server answers with the rect it trusts so a host that reports a wrong
+ * caret (WPS Writer) can still place its own candidate window.
+ */
+inline DWORD PackInputPosition(RECT const& rc) {
+  const int hi_res =
+      static_cast<int>(rc.bottom - rc.top >= 128 || rc.left < -2048 ||
+                       rc.left >= 2048 || rc.top < -2048 || rc.top >= 2048);
+  int left = rc.left >> hi_res;
+  int top = rc.top >> hi_res;
+  int height = (rc.bottom - rc.top) >> hi_res;
+  if (left < -2048)
+    left = -2048;
+  else if (left > 2047)
+    left = 2047;
+  if (top < -2048)
+    top = -2048;
+  else if (top > 2047)
+    top = 2047;
+  if (height < 0)
+    height = 0;
+  else if (height > 127)
+    height = 127;
+  return ((hi_res & 0x01) << 31) | ((height & 0x7f) << 24) |
+         ((top & 0xfff) << 12) | (left & 0xfff);
+}
+
+/* Decodes PackInputPosition; false for the all-zero reply, which is what the
+ * server sends whenever it has no anchor to offer. */
+inline bool UnpackInputPosition(DWORD packed, RECT* rc) {
+  if (!rc)
+    return false;
+  // Doubling with a multiply rather than a left shift: the value is signed and
+  // shifting a negative one left is undefined behaviour.
+  const int scale = ((packed >> 31) & 0x01) ? 2 : 1;
+  const int left =
+      (static_cast<int>(packed & 0x7ff) - static_cast<int>(packed & 0x800)) *
+      scale;
+  const int top = (static_cast<int>((packed >> 12) & 0x7ff) -
+                   static_cast<int>((packed >> 12) & 0x800)) *
+                  scale;
+  const int height = static_cast<int>((packed >> 24) & 0x7f) * scale;
+  if (height <= 0)
+    return false;
+  rc->left = left;
+  rc->top = top;
+  rc->right = left + 6;
+  rc->bottom = top + height;
+  return true;
+}
 
 // 處理請求之物件
 struct RequestHandler {
@@ -136,8 +191,9 @@ class Client {
   bool HighlightCandidateOnCurrentPage(size_t index);
   // 翻页，backward = true 向前翻，false向后翻
   bool ChangePage(bool backward);
-  // 更新输入位置
-  void UpdateInputPosition(RECT const& rc);
+  // 更新输入位置；返回 server 认可的 caret 位置（PackInputPosition 编码），
+  // 0 表示 server 没有可用的位置，调用方沿用自己算出的 rect
+  DWORD UpdateInputPosition(RECT const& rc);
   // 输入窗口获得焦点
   void FocusIn();
   // 输入窗口失去焦点

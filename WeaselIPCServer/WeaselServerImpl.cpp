@@ -301,11 +301,17 @@ DWORD ServerImpl::OnUpdateInputPosition(WEASEL_IPC_COMMAND uMsg,
   // does not answer while it is waiting for an IME reply. When both agree (the
   // usual case, e.g. inline composition) keep what the client sent, so a
   // correct answer never gets jitter.
+  //
+  // Writer draws its candidate window from inside its own process, so this
+  // rect is also handed back to the client in the reply: that is the only way
+  // the host can learn the caret the user actually sees.
+  DWORD anchor = 0;
   {
     HWND doc_window = nullptr;
     if (wps_anchor::Enabled() && wps_anchor::TargetIsWriter(&doc_window)) {
       RECT caret = {};
       if (wps_anchor::LatestAnchor(doc_window, &caret)) {
+        anchor = PackInputPosition(caret);
         const bool agree = caret.left >= rc.left - 3 &&
                            caret.left <= rc.left + 3 &&
                            caret.top >= rc.top - 3 && caret.top <= rc.top + 3;
@@ -337,7 +343,7 @@ DWORD ServerImpl::OnUpdateInputPosition(WEASEL_IPC_COMMAND uMsg,
   }
 
   m_pRequestHandler->UpdateInputPosition(rc, lParam);
-  return 0;
+  return anchor;
 }
 
 DWORD ServerImpl::OnStartMaintenance(WEASEL_IPC_COMMAND uMsg,

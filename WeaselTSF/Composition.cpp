@@ -918,8 +918,18 @@ void WeaselTSF::_SetCompositionPosition(const RECT& rc) {
   RECT _rc;
   _rc.left = _rc.right = rc.left;
   _rc.top = _rc.bottom = rc.bottom;
-  m_client.UpdateInputPosition(rc);
-  _cand->UpdateInputPosition(rc);
+  /* Hosts that paint their own caret can also refuse to map it onto text: WPS
+   * Writer answers with a corner of the document window, so everything this
+   * client derives from TSF is wrong there. The server reads the real caret
+   * from the host's automation model and hands it back in the reply; when it
+   * has one, that is what the candidate window follows. */
+  RECT anchored = {};
+  const DWORD reply = m_client.UpdateInputPosition(rc);
+  if (weasel::UnpackInputPosition(reply, &anchored)) {
+    _cand->UpdateInputPosition(anchored);
+  } else {
+    _cand->UpdateInputPosition(rc);
+  }
   _FlushPendingUI();
 }
 

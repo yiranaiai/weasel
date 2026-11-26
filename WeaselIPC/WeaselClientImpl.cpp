@@ -103,30 +103,14 @@ bool ClientImpl::ChangePage(bool backward) {
   return ret != 0;
 }
 
-void ClientImpl::UpdateInputPosition(RECT const& rc) {
+DWORD ClientImpl::UpdateInputPosition(RECT const& rc) {
   if (!_Active())
-    return;
-  /*
-  移位标志 = 1bit == 0
-  height:0~127 = 7bit
-  top:-2048~2047 = 12bit（有符号）
-  left:-2048~2047 = 12bit（有符号）
-
-  高解析度下：
-  移位标志 = 1bit == 1
-  height:0~254 = 7bit（舍弃低1位）
-  top:-4096~4094 = 12bit（有符号，舍弃低1位）
-  left:-4096~4094 = 12bit（有符号，舍弃低1位）
-  */
-  int hi_res =
-      static_cast<int>(rc.bottom - rc.top >= 128 || rc.left < -2048 ||
-                       rc.left >= 2048 || rc.top < -2048 || rc.top >= 2048);
-  int left = max(-2048, min(2047, rc.left >> hi_res));
-  int top = max(-2048, min(2047, rc.top >> hi_res));
-  int height = max(0, min(127, (rc.bottom - rc.top) >> hi_res));
-  DWORD compressed_rect = ((hi_res & 0x01) << 31) | ((height & 0x7f) << 24) |
-                          ((top & 0xfff) << 12) | (left & 0xfff);
-  _SendMessage(WEASEL_IPC_UPDATE_INPUT_POS, compressed_rect, session_id);
+    return 0;
+  // The bit layout of the request is documented at PackInputPosition. The
+  // reply carries the rect the server trusts for this host, or 0 when it has
+  // no anchor to offer.
+  return static_cast<DWORD>(_SendMessage(WEASEL_IPC_UPDATE_INPUT_POS,
+                                         PackInputPosition(rc), session_id));
 }
 
 void ClientImpl::FocusIn() {
@@ -284,8 +268,8 @@ bool Client::ChangePage(bool backward) {
   return m_pImpl->ChangePage(backward);
 }
 
-void Client::UpdateInputPosition(RECT const& rc) {
-  m_pImpl->UpdateInputPosition(rc);
+DWORD Client::UpdateInputPosition(RECT const& rc) {
+  return m_pImpl->UpdateInputPosition(rc);
 }
 
 void Client::FocusIn() {
