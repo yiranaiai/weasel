@@ -337,12 +337,34 @@ STDMETHODIMP CGetTextExtentEditSession::DoEditSession(TfEditCookie ec) {
   if (_pContextView != nullptr)
     hr_ext = _pContextView->GetTextExt(ec, pRange, &rc, &fClipped);
 
-  if (hr_ext == S_OK && _enhancedPosition) {
+  /* WPS Writer is the one host whose real caret lives outside TSF. Ask the
+   * server for it before reporting anything: it answers from its cache, and the
+   * class check keeps every other host off that IPC round trip. */
+  if (_IsWriterHost(hwnd_host)) {
+    RECT anchored = {};
+    if (_pTextService->_CaretAnchor(&anchored)) {
+      _DiagCompositionRect(hwnd_host, hr_ext, anchored, "writer-anchor");
+      _pTextService->_SetCompositionPosition(anchored);
+      return S_OK;
+    }
+  }
+
+  /* Below is stock Weasel, unchanged: a rect is reported only when the host
+   * produced one, and the enhanced correction still measures against the
+   * foreground window. Hosts that answer nothing (UWP/XAML islands such as
+   * Task Manager) therefore see exactly what they saw before this branch
+   * existed - no position reported at all. */
+  if (hr_ext == S_OK && (rc.left != 0 || rc.top != 0)) {
+    _DiagCompositionRect(hwnd_host, hr_ext, rc, "host");
+
     // get the foreground window pos and check if rc from GetTextExt is out of
     // window
-    HWND hwnd = hwnd_host != nullptr ? hwnd_host : ::GetForegroundWindow();
-    RECT rcForegroundWindow;
-    if (hwnd != nullptr && ::GetWindowRect(hwnd, &rcForegroundWindow)) {
+    if (_enhancedPosition) {
+      HWND hwnd;
+      RECT rcForegroundWindow;
+      hwnd = ::GetForegroundWindow();
+      ::GetWindowRect(hwnd, &rcForegroundWindow);
+
       if (rc.left < rcForegroundWindow.left ||
           rc.left > rcForegroundWindow.right ||
           rc.top < rcForegroundWindow.top ||
@@ -357,29 +379,10 @@ STDMETHODIMP CGetTextExtentEditSession::DoEditSession(TfEditCookie ec) {
         rc.bottom += offsety;
       }
     }
-  }
-
-  /* WPS Writer is the one host whose real caret lives outside TSF. Ask the
-   * server for it before reporting anything: it answers from its cache, and the
-   * class check keeps every other host off that IPC round trip. */
-  if (_IsWriterHost(hwnd_host)) {
-    RECT anchored = {};
-    if (_pTextService->_CaretAnchor(&anchored)) {
-      _DiagCompositionRect(hwnd_host, hr_ext, anchored, "writer-anchor");
-      _pTextService->_SetCompositionPosition(anchored);
-      return S_OK;
-    }
-  }
-
-  /* Otherwise report only a rect the host actually produced. Handing the
-   * all-zero answer to hosts that reply with nothing (UWP/XAML islands such as
-   * Task Manager) parked the candidate window in the screen corner on every
-   * keystroke, and is what made typing there crawl; stock Weasel simply did not
-   * report a position for them, and that is what they expect. */
-  const bool reported = SUCCEEDED(hr_ext) && (rc.left != 0 || rc.top != 0);
-  _DiagCompositionRect(hwnd_host, hr_ext, rc, reported ? "host" : "none");
-  if (reported)
     _pTextService->_SetCompositionPosition(rc);
+  } else {
+    _DiagCompositionRect(hwnd_host, hr_ext, rc, "none");
+  }
   return S_OK;
 }
 
@@ -395,10 +398,21 @@ BOOL WeaselTSF::_UpdateCompositionWindow(com_ptr<ITfContext> pContext) {
   if (pEditSession == NULL) {
     return FALSE;
   }
-  HRESULT hr = E_FAIL;
-  pContext->RequestEditSession(_tfClientId, pEditSession,
-                               TF_ES_ASYNCDONTCARE | TF_ES_READWRITE, &hr);
-  if (FAILED(hr)) {
+  HRESULT hr;
+  /* WPS hosts only: their text store answers GetTextExt from a read/write
+   * session (and refuses the stock read-only one), so those two classes get the
+   * wider request with the stock request as fallback. Every other host takes
+   * the stock request unchanged - one call, read-only, exactly as upstream. */
+  HWND hwnd_host = nullptr;
+  pContextView->GetWnd(&hwnd_host);
+  if (_IsPresentationFrame(hwnd_host) || _IsWriterHost(hwnd_host)) {
+    hr = E_FAIL;
+    pContext->RequestEditSession(_tfClientId, pEditSession,
+                                 TF_ES_ASYNCDONTCARE | TF_ES_READWRITE, &hr);
+    if (FAILED(hr))
+      pContext->RequestEditSession(_tfClientId, pEditSession,
+                                   TF_ES_ASYNCDONTCARE | TF_ES_READ, &hr);
+  } else {
     pContext->RequestEditSession(_tfClientId, pEditSession,
                                  TF_ES_ASYNCDONTCARE | TF_ES_READ, &hr);
   }
