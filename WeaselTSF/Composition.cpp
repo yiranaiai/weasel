@@ -139,21 +139,12 @@ void WeaselTSF::_EndComposition(com_ptr<ITfContext> pContext,
 /* Composition anchor helpers.
  *
  * TSF hosts are expected to report the caret rectangle through
- * ITfContextView::GetTextExt. WPS Writer/Presentation draw their own caret and
- * never answer that query, so the candidate window used to keep whatever
- * default position the UI had, which lands in the bottom-right corner. The
- * helpers below build a fallback chain so a usable screen-space anchor is
- * nearly always available:
- *
- *   1. GetTextExt, accepted only when it overlaps the host window
- *   2. GUITHREADINFO::rcCaret of the host UI thread
- *   3. GetTextExt on a neighbour range, for hosts that refuse a collapsed one
- *   4. GetTextExt on our composition after a temporary invisible filler, for
- *      hosts that report no extent unless the range carries a character
- *   5. GetCaretPos() of the calling thread
- *   6. the IMM32 composition window position
- *   7. the last anchor that was actually reported
- *   8. the host window origin, which always exists
+ * ITfContextView::GetTextExt, and for almost every host that answer is the
+ * truth: it is what the candidate window is placed on, and nothing here
+ * second-guesses it. WPS Writer is the exception that the server handles (it
+ * reads the caret from the Writer automation model and overrides the position
+ * in WeaselTSF::_SetCompositionPosition), and WPS Presentation needs a special
+ * case of its own, see _IsPresentationFrame below.
  *
  * All rects are screen coordinates in physical pixels: Weasel is per-monitor
  * DPI aware and every API used here already reports physical pixels, so no
@@ -201,6 +192,64 @@ bool _IsAnchorUsable(const RECT& rc, HWND hwnd_host) {
     }
   }
   return true;
+}
+
+/* WPS Presentation (class PP12FrameClass; the slide view itself runs in a
+ * separate wpp.exe but the frame window still carries that class) answers
+ * GetTextExt with a rectangle that is only recomputed when an edit commits.
+ * It reports a corner of the slide area for a fresh composition, and after the
+ * first commit keeps reporting the caret as it was at that moment: later caret
+ * moves are never reflected. Every composition that follows a caret move then
+ * landed on the previous caret, which reads as the candidate window being one
+ * step behind.
+ *
+ * The click that placed the caret is the one live signal the host leaves us:
+ * the user clicks the line to edit and starts typing, so the mouse sits on the
+ * spot being typed into. Typing again without moving the mouse keeps that
+ * anchor. Nothing else takes this path - every other host, including WPS
+ * Writer, still uses the rect TSF reports. */
+bool _IsPresentationFrame(HWND hwnd) {
+  if (hwnd == nullptr)
+    return false;
+  HWND root = ::GetAncestor(hwnd, GA_ROOT);
+  if (root == nullptr)
+    root = hwnd;
+  wchar_t name[64] = {0};
+  if (!::GetClassNameW(root, name, _countof(name)))
+    return false;
+  return wcscmp(name, L"PP12FrameClass") == 0;
+}
+
+/* Line height is only used to keep the rect looking like a caret; the UI places
+ * the candidate window under rc.bottom either way. */
+const int kPresentationCaretHeight = 20;
+
+/* Anchor for a composition the host cannot locate: the mouse position when it
+ * is over the slide view, else the view origin, which at least keeps the
+ * candidate window inside the document instead of on a screen corner. */
+void _PresentationAnchor(ITfContextView* view, RECT* out) {
+  RECT bounds = {0, 0, 0, 0};
+  const bool have_bounds =
+      view != nullptr && SUCCEEDED(view->GetScreenExt(&bounds)) &&
+      bounds.right > bounds.left && bounds.bottom > bounds.top;
+  POINT pt = {0, 0};
+  if (have_bounds && ::GetCursorPos(&pt) && ::PtInRect(&bounds, pt)) {
+    out->left = pt.x;
+    out->right = pt.x;
+    out->top = pt.y - kPresentationCaretHeight;
+    out->bottom = pt.y;
+    return;
+  }
+  if (have_bounds) {
+    out->left = bounds.left + 4;
+    out->top = bounds.top + 4;
+    out->right = out->left;
+    out->bottom = out->top + kPresentationCaretHeight;
+    return;
+  }
+  out->left = out->right = 0;
+  out->top = 0;
+  out->bottom = kPresentationCaretHeight;
 }
 
 /* imm32.lib is not linked into WeaselTSF (see WeaselTSF.vcxproj and
@@ -773,6 +822,16 @@ STDMETHODIMP CGetTextExtentEditSession::DoEditSession(TfEditCookie ec) {
   HWND hwnd_host = nullptr;
   if (_pContextView != nullptr)
     _pContextView->GetWnd(&hwnd_host);
+
+  /* The presentation host never answers GetTextExt with the current caret, so
+   * asking it is pointless: anchor on the click that placed the caret instead
+   * and return before the rect below is built. */
+  if (_IsPresentationFrame(hwnd_host)) {
+    RECT presentation_rc = {};
+    _PresentationAnchor(_pContextView, &presentation_rc);
+    _pTextService->_SetCompositionPosition(presentation_rc);
+    return S_OK;
+  }
 
   HRESULT hr_ext = E_FAIL;
   if (_pContextView != nullptr)
