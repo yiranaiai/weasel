@@ -122,6 +122,8 @@ class WeaselTSF : public ITfTextInputProcessorEx,
   BOOL _IsCurrentComposition(ITfComposition* pComposition);
   void _SetComposition(com_ptr<ITfComposition> pComposition);
   void _SetCompositionPosition(const RECT& rc);
+  // Caret the server trusts for the focused host, false when it has none.
+  bool _CaretAnchor(RECT* anchor);
   BOOL _UpdateCompositionWindow(com_ptr<ITfContext> pContext);
   // Publish UI data after the composition position has been updated.
   void _FlushPendingUI();
