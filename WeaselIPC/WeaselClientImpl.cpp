@@ -113,6 +113,13 @@ DWORD ClientImpl::UpdateInputPosition(RECT const& rc) {
                                          PackInputPosition(rc), session_id));
 }
 
+DWORD ClientImpl::GetCaretAnchor() {
+  if (!_Active())
+    return 0;
+  return static_cast<DWORD>(
+      _SendMessage(WEASEL_IPC_GET_CARET_ANCHOR, 0, session_id));
+}
+
 void ClientImpl::FocusIn() {
   DWORD client_caps = 0; /* TODO */
   _SendMessage(WEASEL_IPC_FOCUS_IN, client_caps, session_id);
@@ -201,6 +208,7 @@ DWORD _TimeoutForCommand(WEASEL_IPC_COMMAND msg, DWORD wParam) {
     case WEASEL_IPC_FOCUS_IN:
     case WEASEL_IPC_FOCUS_OUT:
     case WEASEL_IPC_UPDATE_INPUT_POS:
+    case WEASEL_IPC_GET_CARET_ANCHOR:
     case WEASEL_IPC_TRAY_COMMAND:
       return PipeChannelBase::kClientFocusTimeoutMs;
     case WEASEL_IPC_PROCESS_KEY_EVENT:
@@ -270,6 +278,10 @@ bool Client::ChangePage(bool backward) {
 
 DWORD Client::UpdateInputPosition(RECT const& rc) {
   return m_pImpl->UpdateInputPosition(rc);
+}
+
+DWORD Client::GetCaretAnchor() {
+  return m_pImpl->GetCaretAnchor();
 }
 
 void Client::FocusIn() {

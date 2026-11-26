@@ -24,6 +24,7 @@ class ClientImpl {
   bool HighlightCandidateOnCurrentPage(size_t index);
   bool ChangePage(bool backward);
   DWORD UpdateInputPosition(RECT const& rc);
+  DWORD GetCaretAnchor();
   void FocusIn();
   void FocusOut();
   void TrayCommand(UINT menuId);

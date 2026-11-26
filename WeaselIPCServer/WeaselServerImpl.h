@@ -62,6 +62,7 @@ class ServerImpl : public CWindowImpl<ServerImpl, CWindow, ServerWinTraits>
   DWORD OnUpdateInputPosition(WEASEL_IPC_COMMAND uMsg,
                               DWORD wParam,
                               DWORD lParam);
+  DWORD OnGetCaretAnchor(WEASEL_IPC_COMMAND uMsg, DWORD wParam, DWORD lParam);
   DWORD OnStartMaintenance(WEASEL_IPC_COMMAND uMsg, DWORD wParam, DWORD lParam);
   DWORD OnEndMaintenance(WEASEL_IPC_COMMAND uMsg, DWORD wParam, DWORD lParam);
   DWORD OnCommitComposition(WEASEL_IPC_COMMAND uMsg,

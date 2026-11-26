@@ -32,6 +32,12 @@ enum WEASEL_IPC_COMMAND {
   WEASEL_IPC_SELECT_CANDIDATE_ON_CURRENT_PAGE,
   WEASEL_IPC_HIGHLIGHT_CANDIDATE_ON_CURRENT_PAGE,
   WEASEL_IPC_CHANGE_PAGE,
+  /* Asks the server for the caret it trusts for the focused host, packed with
+   * PackInputPosition; 0 means it has none. This is deliberately separate from
+   * UPDATE_INPUT_POS: that message makes the server refresh its own window and
+   * can outlast the client's budget, while this one only reads the cached
+   * anchor and never touches the UI. */
+  WEASEL_IPC_GET_CARET_ANCHOR,
   WEASEL_IPC_LAST_COMMAND
 };
 
@@ -194,6 +200,8 @@ class Client {
   // 更新输入位置；返回 server 认可的 caret 位置（PackInputPosition 编码），
   // 0 表示 server 没有可用的位置，调用方沿用自己算出的 rect
   DWORD UpdateInputPosition(RECT const& rc);
+  // 询问 server 认可的 caret 位置（PackInputPosition 编码），0 表示没有可用位置
+  DWORD GetCaretAnchor();
   // 输入窗口获得焦点
   void FocusIn();
   // 输入窗口失去焦点

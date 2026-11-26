@@ -346,6 +346,22 @@ DWORD ServerImpl::OnUpdateInputPosition(WEASEL_IPC_COMMAND uMsg,
   return anchor;
 }
 
+/* Answers with the caret the server trusts for the host that is in front right
+ * now, packed the same way the request rect is. It only reads the cache the
+ * anchor reader keeps warm, so it can be called while the client is holding a
+ * composition open without waiting on the server's own UI refresh. */
+DWORD ServerImpl::OnGetCaretAnchor(WEASEL_IPC_COMMAND uMsg,
+                                   DWORD wParam,
+                                   DWORD lParam) {
+  HWND doc_window = nullptr;
+  RECT caret = {};
+  if (!wps_anchor::Enabled() || !wps_anchor::TargetIsWriter(&doc_window))
+    return 0;
+  if (!wps_anchor::LatestAnchor(doc_window, &caret))
+    return 0;
+  return PackInputPosition(caret);
+}
+
 DWORD ServerImpl::OnStartMaintenance(WEASEL_IPC_COMMAND uMsg,
                                      DWORD wParam,
                                      DWORD lParam) {
@@ -441,6 +457,7 @@ void ServerImpl::HandlePipeMessage(PipeMessage pipe_msg, _Resp resp) {
   PIPE_MSG_HANDLE(WEASEL_IPC_FOCUS_IN, OnFocusIn)
   PIPE_MSG_HANDLE(WEASEL_IPC_FOCUS_OUT, OnFocusOut)
   PIPE_MSG_HANDLE(WEASEL_IPC_UPDATE_INPUT_POS, OnUpdateInputPosition)
+  PIPE_MSG_HANDLE(WEASEL_IPC_GET_CARET_ANCHOR, OnGetCaretAnchor)
   PIPE_MSG_HANDLE(WEASEL_IPC_START_MAINTENANCE, OnStartMaintenance)
   PIPE_MSG_HANDLE(WEASEL_IPC_END_MAINTENANCE, OnEndMaintenance)
   PIPE_MSG_HANDLE(WEASEL_IPC_COMMIT_COMPOSITION, OnCommitComposition)
