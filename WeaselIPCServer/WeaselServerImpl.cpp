@@ -356,16 +356,16 @@ DWORD ServerImpl::OnGetCaretAnchor(WEASEL_IPC_COMMAND uMsg,
   HWND doc_window = nullptr;
   RECT caret = {};
   /* Diagnostic: this handler is the only proof that a host actually asks for
-   * the anchor, so record every call with its answer. */
+   * the anchor, so record every call with its answer. Keep the line free of
+   * casts and stream manipulators so it stays portable. */
   const bool enabled = wps_anchor::Enabled();
   const bool is_writer = enabled && wps_anchor::TargetIsWriter(&doc_window);
   DWORD reply = 0;
   if (is_writer && wps_anchor::LatestAnchor(doc_window, &caret))
     reply = PackInputPosition(caret);
   LOG(INFO) << "caret anchor asked: enabled=" << enabled
-            << " writer=" << is_writer << " doc=0x" << std::hex
-            << static_cast<unsigned long long>(doc_window) << " reply=0x"
-            << reply << std::dec << " session=" << lParam;
+            << " writer=" << is_writer << " reply=" << reply
+            << " session=" << lParam;
   return reply;
 }
 
