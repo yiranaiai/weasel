@@ -609,8 +609,12 @@ int _CompositionEmpty(TfEditCookie ec, ITfComposition* composition) {
  * composition that holds text here is either our own stale filler from an
  * update that never measured it - removed - or a preedit, which is left alone.
  */
-bool _ArmProbeWrite(TfEditCookie ec, ITfComposition* composition) {
-  if (g_probe_disabled.load() || composition == nullptr)
+bool _ArmProbeWrite(TfEditCookie ec,
+                    WeaselTSF* text_service,
+                    ITfContext* context,
+                    ITfComposition* composition) {
+  if (g_probe_disabled.load() || composition == nullptr ||
+      text_service == nullptr)
     return false;
 
   const int empty = _CompositionEmpty(ec, composition);
@@ -629,6 +633,21 @@ bool _ArmProbeWrite(TfEditCookie ec, ITfComposition* composition) {
     return false;
   if (range->SetText(ec, 0, L"\u200B", 1) != S_OK)
     return false;
+
+  /* Present the filler exactly like an inline preedit, because that is the only
+   * shape WPS maps to a layout: it carries the composing display attribute and
+   * the selection sits inside the composition. A bare SetText, with or without
+   * a real character, is ignored and answered with the corner sentinel. The
+   * filler itself stays invisible, so mimicking the inline presentation shows
+   * nothing. */
+  text_service->_SetCompositionDisplayAttributes(ec, context, range);
+
+  range->Collapse(ec, TF_ANCHOR_END);
+  TF_SELECTION selection;
+  selection.range = range;
+  selection.style.ase = TF_AE_NONE;
+  selection.style.fInterimChar = FALSE;
+  context->SetSelection(ec, 1, &selection);
 
   g_probe_armed.store(true);
   FILE* fp = _OpenTraceFile();
@@ -740,11 +759,14 @@ STDMETHODIMP CProbeMeasureEditSession::DoEditSession(TfEditCookie ec) {
       hr_ext = view->GetTextExt(ec, range, &rc, &clipped);
     }
   }
+  const RECT ext_rc = rc;
 
   /* Take the filler out whatever the extent said, then verify against the
    * composition itself rather than the range kept above. */
   int empty_after = -1;
   if (_pComposition != nullptr) {
+    _pTextService->_ClearCompositionDisplayAttributes(ec, _pContext);
+
     com_ptr<ITfRange> clean;
     if (_pComposition->GetRange(&clean) == S_OK && clean != nullptr)
       clean->SetText(ec, 0, L"", 0);
@@ -759,6 +781,18 @@ STDMETHODIMP CProbeMeasureEditSession::DoEditSession(TfEditCookie ec) {
     }
     if (empty_after == 0)
       g_probe_disabled.store(true);  // never probe this process again
+
+    /* The probe moved the caret past the filler; put it back at the start of
+     * the composition, where it was before arming. */
+    com_ptr<ITfRange> restore;
+    if (_pComposition->GetRange(&restore) == S_OK && restore != nullptr) {
+      restore->Collapse(ec, TF_ANCHOR_START);
+      TF_SELECTION selection;
+      selection.range = restore;
+      selection.style.ase = TF_AE_NONE;
+      selection.style.fInterimChar = FALSE;
+      _pContext->SetSelection(ec, 1, &selection);
+    }
   }
   g_probe_armed.store(false);
 
@@ -782,10 +816,11 @@ STDMETHODIMP CProbeMeasureEditSession::DoEditSession(TfEditCookie ec) {
   if (fp != nullptr) {
     const std::string now = current_time();
     ::fprintf(fp,
-              "%s probe2 ext=0x%lx empty=%d anchored=%d final=(%ld,%ld,%ld,%ld)"
-              "\n",
-              now.c_str(), (long)hr_ext, empty_after, found ? 1 : 0, rc.left,
-              rc.top, rc.right, rc.bottom);
+              "%s probe2 ext=0x%lx rc=(%ld,%ld,%ld,%ld) empty=%d anchored=%d "
+              "final=(%ld,%ld,%ld,%ld)\n",
+              now.c_str(), (long)hr_ext, ext_rc.left, ext_rc.top, ext_rc.right,
+              ext_rc.bottom, empty_after, found ? 1 : 0, rc.left, rc.top,
+              rc.right, rc.bottom);
     ::fclose(fp);
   }
 
@@ -921,7 +956,7 @@ STDMETHODIMP CGetTextExtentEditSession::DoEditSession(TfEditCookie ec) {
    * character, so arm the deferred probe: this session inserts an invisible
    * filler, the next update measures it. */
   if (!anchored && _pComposition != nullptr)
-    _ArmProbeWrite(ec, _pComposition);
+    _ArmProbeWrite(ec, _pTextService, _pContext, _pComposition);
   if (!anchored && _AnchorFromCaretPos(hwnd_host, &rc)) {
     anchored = true;
     source = "caret_pos";
